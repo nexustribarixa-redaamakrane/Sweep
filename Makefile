@@ -1,0 +1,2282 @@
+# ==============================================================================
+# Makefile for OpenWindows - Freestanding C99 Kernel
+# Non-POSIX | NT-Like | Everything is an Object
+# Produces openwinkrnl.owx (OWX1 native kernel image)
+# ==============================================================================
+
+CC = gcc
+
+# Keep the full OpenWindows image as the default goal even though helper targets
+# (e.g. check-external-deps) are defined earlier in this file.
+.DEFAULT_GOAL := all
+
+# External dependency roots (configurable; defaults preserve existing layout).
+ESSENTIALS_ROOT   ?= ../OpenWindows-Essentials
+SUPERUNICODE_ROOT ?= ../superunicode
+VIP_ROOT          ?= ../vip
+STORAGE_ROOT      ?= ../OpenWindows-Storage
+
+# Ecosystem source directories
+BANCODE_DIR = ./bancode
+SUTF_DIR    = $(SUPERUNICODE_ROOT)/sutf
+SUST_DIR    = $(SUPERUNICODE_ROOT)/sust
+EXTSU_DIR   = $(SUPERUNICODE_ROOT)/superunicode_extended
+SUAS_DIR    = $(SUPERUNICODE_ROOT)
+SUF_DIR     = $(ESSENTIALS_ROOT)/vendor/superunicode/suf
+VIP_DIR     = $(VIP_ROOT)
+STORAGE_COMMON_DIR = $(STORAGE_ROOT)/common
+OWFS_DIR    = $(STORAGE_ROOT)/owfs
+USFS_DIR    = $(STORAGE_ROOT)/usfs
+
+# ------------------------------------------------------------------------------
+# Profile-aware external dependency manifest (R4).
+#
+# The build/test targets consume sources and headers from sibling repositories
+# that are NOT vendored here.  Their roots are configurable above; this manifest
+# names a small set of key files per build profile so a wrong root or a missing
+# checkout fails with a clear message instead of a late, confusing compile or
+# link error.  It is a standalone target, not a prerequisite of existing
+# targets, so default behaviour is unchanged.
+#
+#   make check-external-deps                        # full image + hosttest
+#   make check-external-deps EXTERNAL_DEPS_PROFILE=sweep-kernel
+#   make check-external-deps EXTERNAL_DEPS_PROFILE=sweep-tests
+#   make check-external-deps EXTERNAL_DEPS_PROFILE=freestanding
+# ------------------------------------------------------------------------------
+EXTERNAL_DEPS_PROFILE ?= full
+
+EXT_DEPS_ESSENTIALS = \
+    $(SUF_DIR)/include/suf/suf_types.h \
+    $(SUF_DIR)/include/suf/suf_parser.h \
+    $(SUF_DIR)/src/suf_parser.c
+EXT_DEPS_SUPERUNICODE = \
+    $(SUTF_DIR)/include/sutf.h \
+    $(SUTF_DIR)/src/sutf8.c \
+    $(SUST_DIR)/include/sust.h \
+    $(SUST_DIR)/src/sust16.c \
+    $(EXTSU_DIR)/include/extsucs_types.h \
+    $(SUAS_DIR)/include/suas/suas_core.h \
+    $(SUAS_DIR)/src/suas/suas_sdf.c
+EXT_DEPS_VIP = $(VIP_DIR)/univip_fvip.h $(VIP_DIR)/univip_fvip.c
+EXT_DEPS_STORAGE = \
+    $(STORAGE_COMMON_DIR)/include/ow_checksum.h \
+    $(STORAGE_COMMON_DIR)/src/ow_checksum.c \
+    $(OWFS_DIR)/include/owfs_bitmap.h \
+    $(OWFS_DIR)/src/owfs_bitmap.c \
+    $(USFS_DIR)/include/usfs_bitmap.h \
+    $(USFS_DIR)/src/usfs_bitmap.c
+
+ifeq ($(EXTERNAL_DEPS_PROFILE),full)
+EXTERNAL_DEPS_FILES = $(EXT_DEPS_ESSENTIALS) $(EXT_DEPS_SUPERUNICODE) \
+                      $(EXT_DEPS_VIP) $(EXT_DEPS_STORAGE)
+else ifeq ($(EXTERNAL_DEPS_PROFILE),sweep-kernel)
+EXTERNAL_DEPS_FILES = $(EXT_DEPS_ESSENTIALS) $(EXT_DEPS_SUPERUNICODE)
+else ifeq ($(EXTERNAL_DEPS_PROFILE),sweep-tests)
+EXTERNAL_DEPS_FILES = $(EXT_DEPS_ESSENTIALS)
+else ifeq ($(EXTERNAL_DEPS_PROFILE),freestanding)
+EXTERNAL_DEPS_FILES =
+else
+$(error unknown EXTERNAL_DEPS_PROFILE '$(EXTERNAL_DEPS_PROFILE)' (use full, sweep-kernel, sweep-tests or freestanding))
+endif
+
+.PHONY: check-external-deps
+check-external-deps:
+	@echo "external dependency check: profile '$(EXTERNAL_DEPS_PROFILE)'"
+	@missing=0; \
+	for f in $(EXTERNAL_DEPS_FILES); do \
+	    if [ ! -e "$$f" ]; then echo "  MISSING $$f"; missing=1; fi; \
+	done; \
+	if [ "$$missing" -ne 0 ]; then \
+	    echo "error: required external dependency is missing for profile '$(EXTERNAL_DEPS_PROFILE)'."; \
+	    echo "       Override the roots, e.g. make check-external-deps \\"; \
+	    echo "         ESSENTIALS_ROOT=/path SUPERUNICODE_ROOT=/path VIP_ROOT=/path STORAGE_ROOT=/path"; \
+	    exit 1; \
+	fi; \
+	echo "external dependencies OK ($(words $(EXTERNAL_DEPS_FILES)) key files)"
+
+CFLAGS = -std=c99 -ffreestanding -nostdlib -fno-stack-protector -fno-pie \
+         -Wall -Wextra -Werror \
+         -I./inc -I./inc/bancode \
+         -I$(SUTF_DIR)/include -I$(SUAS_DIR)/include -I$(VIP_DIR) \
+         -I$(SUST_DIR)/include \
+         -I$(EXTSU_DIR)/include \
+         -I$(SUF_DIR)/include \
+         -I./build-generated/generated \
+         -I$(STORAGE_COMMON_DIR)/include \
+         -I$(OWFS_DIR)/include \
+         -I$(USFS_DIR)/include -g
+
+# Generated terminal font header (lib/ow_superunicode.c and the SuperUnicode
+# host tests include it as "ow_terminal_font.h"; the directory below is on
+# CFLAGS/HOSTTEST_INCLUDES so both build systems resolve the same name).
+TERMINAL_FONT = assets/openwindows-terminal.suf
+FONT_HEADER_DIR = build-generated/generated
+FONT_HEADER = $(FONT_HEADER_DIR)/ow_terminal_font.h
+
+# Object files - Kernel Core
+CORE_OBJS = core/main.o \
+            core/object.o \
+            core/memory.o \
+            core/pgfault.o \
+            core/alpc.o \
+            core/runlevel.o
+
+# Object files - HAL & Diagnostics
+HAL_OBJS  = hal/htl.o \
+            hal/kbd.o \
+            hal/interrupts.o \
+            hal/idt.o \
+            hal/acpi.o
+DIAG_OBJS = diag/bancode_krnl.o
+
+# Object files - Runtime Control (rc.d)
+RC_OBJS = rc/rc.o
+
+# Object files - Process/Task subsystem (NT-like executive + scheduler)
+PS_OBJS = ps/ps.o \
+          ps/switch.o \
+          ps/owx_loader.o
+
+# Object files - Dispatcher objects (NT-like event/semaphore/timer sync)
+SYNC_OBJS = sync/ow_sync.o
+
+# Object files - Deferred procedure calls (NT-like DPC / work queue)
+DPC_OBJS = dpc/ow_dpc.o
+
+# Object files - Kernel Dual Boot (KAPA associated-kernel management)
+KDB_OBJS = kdb/kdb_core.o \
+           kdb/kdb_registry.o \
+           kdb/kdb_loader.o \
+           kdb/kdb_manager.o \
+           kdb/kdb_assoc.o \
+           kdb/kdb_bridge.o \
+           kdb/kdb_sweep.o \
+           kdb/kdb_exec.o \
+           kdb/kdb_exec_ps.o \
+           kdb/kdb_syscall.o
+
+# Object files - User-mode (ring 3) launcher
+USERMODE_OBJS = usermode/usermode.o
+
+# Object files - Subsystems
+VFS_OBJS     = vfs/vfs.o
+NET_OBJS     = net/router.o \
+               net/vip.o
+SENT_OBJS    = sentinel/damagecntrl.o \
+               sentinel/fltrmgr.o
+CIS_OBJS     = cis/cis_core.o cis/cis_format.o cis/cis_verify.o
+SYSCALL_OBJS = syscall/dispatcher.o
+KAPI_OBJS    = kapi/kernel64.o \
+               kapi/ow_skto_name.o
+SHELL_OBJS   = shell/shell.o
+
+# Object files - Libraries
+#
+# ow_sha512 and ow_ed25519 are here because CIS verifies signatures: without
+# them the kernel links cis/cis_verify.o against an undefined
+# ow_crypto_ed25519_verify and the build fails at the link, after the host test
+# has already passed using its own copies of both files.  A library the
+# verification path needs belongs in the image, not only in the harness.
+LIB_OBJS = lib/ow_htl.o \
+           lib/kmem.o \
+           lib/kstring.o \
+           lib/kprintf.o \
+           lib/kalloc.o \
+           lib/sucs.o \
+           lib/ow_superunicode.o \
+           lib/ow_sha256.o \
+           lib/ow_sha512.o \
+           lib/ow_ed25519.o
+
+# Object files - Ecosystem (BANcode)
+BANCODE_OBJS = bancode/bancode.o \
+               bancode/bancode_trap.o
+
+# Object files - Ecosystem (superunicode SUTF)
+SUC_OBJS = sucs/sutf8.o \
+           sucs/sutf16.o \
+           sucs/sutf4.o \
+           sucs/sutf2.o \
+           sucs/sucs_mode.o
+
+# Object files - Ecosystem (superunicode SUAS: SKTO name admission)
+SUAS_OBJS = suas/suas_sdf.o \
+            suas/suas_sgw.o \
+            suas/suas_sbr.o \
+            suas/suas_sucf.o \
+            suas/suas_ssp.o \
+            suas/suas_sts.o \
+            suas/suas_sis.o \
+            suas/suas_sncs.o \
+            suas/suas_sip.o \
+            suas/suas_ssre.o \
+            suas/suas_scms.o \
+            suas/suas_sucd.o \
+            suas/suas_sisr.o \
+            suas/suas_suvtl.o \
+            suas/suas_suamr.o \
+            suas/suas_sukemet.o \
+            suas/suas_sueasd.o \
+            suas/suas_skto.o \
+            suas/suas_stim.o \
+            suas/suas_sucha.o \
+            suas/suas_stx.o \
+            suas/suas_sktc.o \
+            suas/suas_subsystems.o \
+            suas/suas_core.o
+
+# Object files - Ecosystem (superunicode SUTS)
+SUTS_OBJS = suts/suts_suca.o \
+            suts/suts_sre.o \
+            suts/suts_sldf.o \
+            suts/suts_sivd.o \
+            suts/suts_scss.o \
+            suts/suts_sidn.o \
+            suts/suts_sueps.o \
+            suts/suts_susch.o \
+            suts/suts_suldf.o \
+            suts/suts_susn.o \
+            suts/suts_scts.o \
+            suts/suts_scte.o \
+            suts/suts_suicl.o \
+            suts/suts_sulp.o \
+            suts/suts_strs.o \
+            suts/suts_module.o
+
+# Object files - Ecosystem (superunicode SUTR)
+SUTR_OBJS = sutr/sutr_sucsl.o \
+            sutr/sutr_sueas.o \
+            sutr/sutr_sums.o \
+            sutr/sutr_sucem.o \
+            sutr/sutr_sucpm.o \
+            sutr/sutr_sumnls.o \
+            sutr/sutr_sucm.o \
+            sutr/sutr_oktp.o \
+            sutr/sutr_sie.o \
+            sutr/sutr_sfs.o \
+            sutr/sutr_sim.o \
+            sutr/sutr_skc.o
+
+# Object files - Ecosystem (superunicode SUST)
+SUST_OBJS = sust/sust16.o \
+            sust/sustfixed.o \
+            sust/esust.o
+
+# Object files - Ecosystem (superunicode SUF font parser)
+SUF_OBJS = suf/suf_parser.o
+
+# Object files - Ecosystem (vip UniVIP/FVIP)
+VIP_OBJS = vip/univip_fvip.o
+
+# Object files - Ecosystem (OpenWindows-Storage common, sans ow_mem/ow_htl)
+STOR_COMMON_OBJS = storage/ow_checksum.o \
+                   storage/ow_string.o \
+                   storage/ow_sec.o \
+                   storage/ow_crypto.o
+
+# Object files - Ecosystem (OWFS filesystem)
+OWFS_OBJS = storage/owfs_bitmap.o \
+            storage/owfs_blockio.o \
+            storage/owfs_blockmap.o \
+            storage/owfs_catalog.o \
+            storage/owfs_file.o \
+            storage/owfs_format.o \
+            storage/owfs_inode.o \
+            storage/owfs_superblock.o \
+            storage/owfs_sync.o
+
+# Object files - Ecosystem (USFS filesystem)
+USFS_OBJS = storage/usfs_bitmap.o \
+            storage/usfs_blockio.o \
+            storage/usfs_entry.o \
+            storage/usfs_file.o \
+            storage/usfs_format.o \
+            storage/usfs_superblock.o \
+            storage/usfs_sync.o
+
+# Object files - Kernel storage integration
+STOR_CORE_OBJS = storage/owdisk.o
+
+# All object files
+ALL_OBJS = $(CORE_OBJS) $(HAL_OBJS) $(RC_OBJS) $(PS_OBJS) $(SYNC_OBJS) $(DPC_OBJS) \
+           $(USERMODE_OBJS) $(KDB_OBJS) \
+           $(DIAG_OBJS) $(VFS_OBJS) \
+           $(NET_OBJS) $(SENT_OBJS) $(CIS_OBJS) $(SYSCALL_OBJS) $(KAPI_OBJS) \
+           $(SHELL_OBJS) $(LIB_OBJS) $(BANCODE_OBJS) \
+           $(SUC_OBJS) $(SUAS_OBJS) $(SUTS_OBJS) $(SUTR_OBJS) \
+           $(SUST_OBJS) $(SUF_OBJS) $(VIP_OBJS) \
+           $(STOR_COMMON_OBJS) $(OWFS_OBJS) $(USFS_OBJS) $(STOR_CORE_OBJS)
+
+# Intermediate image
+PE_IMAGE   = openwinkrnl.pe
+
+# Output OWX binary
+TARGET = openwinkrnl.owx
+
+# OWX packaging parameters
+OWX_SUBSYSTEM = 0x01
+
+# Canonical source & license manifest for CORE_KERNEL policy.  Generated before
+# packing so the packer can embed the manifest's SHA-256 as the source digest.
+# The manifest is deterministic (fixed sort, canonical JSON, LF newlines), so
+# two builds from the same tree produce the same digest.
+MANIFEST_FILE    = openwinkrnl_manifest.cislm
+MANIFEST_DIGEST  = openwinkrnl_manifest.digest
+
+# ==============================================================================
+# Build Rules
+# ==============================================================================
+
+all: $(TARGET)
+
+# Generate the canonical license manifest and its digest.  Depends on the
+# source files the manifest inspects, but listing them all here would duplicate
+# the discovery logic in gen_license_manifest.py, so the phony target is
+# intentional: the manifest tool is fast and its output is deterministic.
+.PHONY: license-manifest
+license-manifest:
+	python tools/gen_license_manifest.py \
+	    --output $(MANIFEST_FILE) \
+	    --digest-out $(MANIFEST_DIGEST)
+
+# tools/owx_pack.py is a real prerequisite, not just a command-line argument.
+# The image and its openwinkrnl.chk are produced by that script, so editing the
+# packer has to invalidate both.  Without it, a change to the packer left a
+# stale .owx (and a stale .chk) in place and `make` reported "Nothing to be
+# done" -- which is how a mismatched checksum pair survived into a test run.
+#
+# When CIS_DEV_TRUST is on, the kernel image carries CORE_KERNEL policy class,
+# a GPL-3.0-or-later licence declaration, and the SHA-256 of the canonical
+# source manifest.  Without CIS_DEV_TRUST the image is unsigned anyway, so the
+# policy args are omitted -- adding them to an unsigned image would change
+# nothing about the refusal and would add a build step that has no consumer.
+ifeq ($(CIS_DEV_TRUST),1)
+$(TARGET): $(PE_IMAGE) tools/owx_pack.py tools/gen_license_manifest.py
+	$(MAKE) license-manifest
+	python tools/owx_pack.py $(PE_IMAGE) $(TARGET) \
+	    --subsystem $(OWX_SUBSYSTEM) \
+	    --policy-class CORE_KERNEL \
+	    --cis-licence GPL-3.0-or-later \
+	    --source-digest $(MANIFEST_DIGEST) \
+	    --sign-dev
+	@echo "=============================================================================="
+	@echo "  OpenWindows Kernel Build Completed Successfully!"
+	@echo "  Target: $(TARGET) | Freestanding C99 | NT-Like Object Architecture"
+	@echo "  Policy: CORE_KERNEL | License: GPL-3.0-or-later | CIS signed"
+	@echo "=============================================================================="
+else
+$(TARGET): $(PE_IMAGE) tools/owx_pack.py
+	python tools/owx_pack.py $(PE_IMAGE) $(TARGET) \
+	    --subsystem $(OWX_SUBSYSTEM)
+	@echo "=============================================================================="
+	@echo "  OpenWindows Kernel Build Completed Successfully!"
+	@echo "  Target: $(TARGET) | Freestanding C99 | NT-Like Object Architecture"
+	@echo "=============================================================================="
+endif
+
+$(PE_IMAGE): $(ALL_OBJS)
+	$(CC) $(CFLAGS) -Wl,--image-base=0x200000 -Wl,-e,_start -o $(PE_IMAGE) $(ALL_OBJS) -lgcc
+
+# Core
+core/%.o: core/%.c
+	@mkdir -p core
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# HAL
+hal/%.o: hal/%.c
+	@mkdir -p hal
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# HAL assembly (hal/interrupts.S - long-mode ISR stubs; GNU as / GAS)
+hal/%.o: hal/%.S
+	@mkdir -p hal
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Diagnostics
+diag/%.o: diag/%.c
+	@mkdir -p diag
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# VFS
+vfs/%.o: vfs/%.c
+	@mkdir -p vfs
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Network
+net/%.o: net/%.c
+	@mkdir -p net
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Sentinel
+sentinel/%.o: sentinel/%.c
+	@mkdir -p sentinel
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Syscall
+syscall/%.o: syscall/%.c
+	@mkdir -p syscall
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Kernel API
+kapi/%.o: kapi/%.c
+	@mkdir -p kapi
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Shell
+shell/%.o: shell/%.c
+	@mkdir -p shell
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Run Control (rc.d)
+rc/%.o: rc/%.c
+	@mkdir -p rc
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Process/Task subsystem
+ps/%.o: ps/%.c
+	@mkdir -p ps
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# PS assembly (ps/switch.S - context-switch primitives; GNU as / GAS)
+ps/%.o: ps/%.S
+	@mkdir -p ps
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Dispatcher objects (sync/ow_sync.c)
+sync/%.o: sync/%.c
+	@mkdir -p sync
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Deferred procedure calls (dpc/ow_dpc.c)
+dpc/%.o: dpc/%.c
+	@mkdir -p dpc
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# User-mode launcher (usermode/usermode.c)
+usermode/%.o: usermode/%.c
+	@mkdir -p usermode
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Libraries
+lib/%.o: lib/%.c
+	@mkdir -p lib
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# BANcode ecosystem (compiled from local bancode directory)
+bancode/%.o: $(BANCODE_DIR)/%.c
+	@mkdir -p bancode
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# superunicode SUTF ecosystem (compiled from sibling repo)
+sucs/%.o: $(SUTF_DIR)/src/%.c
+	@mkdir -p sucs
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# superunicode SUAS ecosystem (compiled from sibling repo)
+suas/%.o: $(SUAS_DIR)/src/suas/%.c
+	@mkdir -p suas
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# superunicode SUTS ecosystem (compiled from sibling repo)
+suts/%.o: $(SUAS_DIR)/src/suts/%.c
+	@mkdir -p suts
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# superunicode SUTR ecosystem (compiled from sibling repo)
+sutr/%.o: $(SUAS_DIR)/src/sutr/%.c
+	@mkdir -p sutr
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# superunicode SUST ecosystem (compiled from sibling repo)
+sust/%.o: $(SUST_DIR)/src/%.c
+	@mkdir -p sust
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# superunicode SUF ecosystem (compiled from sibling repo)
+suf/%.o: $(SUF_DIR)/src/%.c
+	@mkdir -p suf
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Generated terminal font header.  tools/embed_suf.py creates the parent
+# directory itself, but spelling the rule out keeps the dependency visible and
+# rebuilds the header when the font or the generator changes.
+$(FONT_HEADER): $(TERMINAL_FONT) tools/embed_suf.py
+	python tools/embed_suf.py $(TERMINAL_FONT) $@
+
+# lib/ow_superunicode.c includes the generated header as "ow_terminal_font.h".
+lib/ow_superunicode.o: $(FONT_HEADER)
+
+# vip UniVIP/FVIP ecosystem (compiled from sibling repo)
+vip/%.o: $(VIP_DIR)/%.c
+	@mkdir -p vip
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# OpenWindows-Storage common (ow_mem.c/ow_htl.c provided by kernel lib)
+storage/ow_%.o: $(STORAGE_COMMON_DIR)/src/ow_%.c
+	@mkdir -p storage
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# OWFS filesystem (compiled from sibling repo)
+storage/owfs_%.o: $(OWFS_DIR)/src/owfs_%.c
+	@mkdir -p storage
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# USFS filesystem (compiled from sibling repo)
+storage/usfs_%.o: $(USFS_DIR)/src/usfs_%.c
+	@mkdir -p storage
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Kernel storage integration layer
+storage/%.o: storage/%.c
+	@mkdir -p storage
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# ==============================================================================
+# Userspace images and their test-image provisioners
+# ==============================================================================
+# The three user-mode images the Phase 5c survey knows about are produced by two
+# different pipelines on purpose:
+#
+#   owinit.owx   comes from OpenWindows-Essentials, which ships it as a PE wearing
+#                an .owx name, so tools/embed_owx.py packs it here.
+#   owinitv.owx  built HERE, from emergency/.  The recovery path cannot depend on
+#   owrs.owx     another repository being present in order to produce the thing
+#                you boot when the first repository's output is missing.
+#
+# All three become a C header and are provisioned into the freshly formatted RAM
+# volume by a per-image seed object, so the SET of images on a test volume is
+# chosen by the link line and readable straight off the target's recipe.  The
+# production images (openwinkrnl.owx / openwinkrnl.vdi) link none of them.
+EMERGENCY_DIR    = emergency
+EMERGENCY_CFLAGS = -std=c99 -ffreestanding -nostdlib -fno-stack-protector \
+                   -fno-pie -fno-builtin -fno-asynchronous-unwind-tables \
+                   -O2 -Wall -Wextra -Werror -I$(EMERGENCY_DIR)
+
+EMERGENCY_IMAGES = owinitv owrs
+EMERGENCY_OWX    = $(EMERGENCY_IMAGES:%=$(EMERGENCY_DIR)/%.owx)
+EMERGENCY_HDRS   = $(EMERGENCY_IMAGES:%=$(EMERGENCY_DIR)/%_image.h)
+
+# ---- CIS_DEV_TRUST -------------------------------------------------------
+#
+# Off by default, and the default is the security property rather than an
+# inconvenience:
+#
+#   make                     no trust anchors; the loader refuses every image
+#   make CIS_DEV_TRUST=1     trust one development key, and sign images with it
+#
+# With the gate in ps/owx_loader.c, a default build cannot boot.  That is
+# deliberate -- an unreviewed machine that will not run unreviewed code -- but it
+# makes CIS_DEV_TRUST the difference between "boots" and "halts at init", so it
+# needs to be the only way across.
+#
+# The flag does two things and both are required.  -DCIS_DEV_TRUST adds the dev
+# anchor to the trust store in cis/cis_keys.h, and OWX_SIGN_ARGS makes the
+# images carry a signature that anchor accepts.  Either half alone is useless:
+# an anchor with nothing signed for it still refuses everything, and a signed
+# image with no anchor is refused.  Setting only one produces a build that looks
+# configured and boots nothing, which is the correct outcome but a confusing one.
+#
+# The dev seed is public (tools/cis_block.py), so a CIS_DEV_TRUST build executes
+# anything that seed signs.  Never set it for a release.
+ifeq ($(CIS_DEV_TRUST),1)
+CIS_DEV_CFLAGS   = -DCIS_DEV_TRUST
+OWX_SIGN_ARGS    = --sign-dev
+else
+CIS_DEV_CFLAGS   =
+OWX_SIGN_ARGS    =
+endif
+
+CFLAGS          += $(CIS_DEV_CFLAGS)
+EMERGENCY_CFLAGS += $(CIS_DEV_CFLAGS)
+
+# Switching CIS_DEV_TRUST changes the bytes of every generated image header, but
+# nothing on disk changes to tell make so.  Without this stamp, `make hosttest`
+# followed by `make hosttest CIS_DEV_TRUST=1` reuses the unsigned header and the
+# opt-in build silently boots nothing -- which is exactly the failure the opt-in
+# exists to rule out.
+#
+# The stamp's CONTENT is the setting; its timestamp is what make reads.  Written
+# with the value inside so that flipping the flag and flipping it back both
+# produce a change, rather than a timestamp that says nothing about what changed.
+CIS_STAMP = $(EMERGENCY_DIR)/.cis_dev_trust
+CIS_STAMP_VALUE = CIS_DEV_TRUST=$(CIS_DEV_TRUST) SIGN_ARGS=$(OWX_SIGN_ARGS)
+
+# Runs every time (FORCE), but rewrites only on change: a changed value updates
+# the timestamp and so forces the affected objects and generated images to
+# rebuild, while an unchanged value leaves the timestamp alone and everything
+# stays cached.  $(CIS_STAMP) itself must NOT be .PHONY -- make treats a phony
+# prerequisite as always newer, which would rebuild every dependent on every run.
+.PHONY: FORCE
+FORCE:
+
+$(CIS_STAMP): FORCE
+	@mkdir -p $(EMERGENCY_DIR)
+	@printf '%s\n' '$(CIS_STAMP_VALUE)' > $@.new
+	@cmp -s $@.new $@ || mv $@.new $@
+	@rm -f $@.new
+
+# Per-image seed objects.  A test image links the ones its volume should carry.
+OWINIT_SEED_OBJ  = boot/owinit_seed.o
+OWINITV_SEED_OBJ = boot/owinitv_seed.o
+OWRS_SEED_OBJ    = boot/owrs_seed.o
+# openwinkrnl.chk is the sentinel's kernel-checksum fixture.  It is not a
+# userspace image, so it is not part of the per-image set, but every seeded test
+# image needs it: the kernel-integrity phase (Phase 5c.2, before the init
+# hand-off) halts with a fatal integrity code when it is absent, so an image
+# that omits this looks like a kernel-integrity failure rather than a missing
+# fixture.
+OWCHK_SEED_OBJ   = boot/owchk_seed.o
+SEED_OBJS        = $(OWINIT_SEED_OBJ) $(OWINITV_SEED_OBJ) $(OWRS_SEED_OBJ) $(OWCHK_SEED_OBJ)
+
+# CIS_DEV_TRUST changes CFLAGS for every kernel and seed object, but make cannot
+# see a flag change on its own.  Depend on the value-stamped CIS_STAMP so that
+# flipping the flag rebuilds these objects; without it, a plain `make` after a
+# CIS_DEV_TRUST build relinks the kernel from development-trust objects and packs
+# a production image that still pins the development key.
+$(ALL_OBJS) $(SEED_OBJS): $(CIS_STAMP)
+
+MAKEFILE_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+# ESSENTIALS_ROOT defaults to a neighboring checkout (see the external dependency
+# roots at the top of this file); override it for other layouts.
+ESSENTIALS_ARTIFACTS ?= $(ESSENTIALS_ROOT)/Artifacts/Software
+ESSENTIALS_BUILD ?= $(ESSENTIALS_ROOT)/build-gcc
+OWINIT_SOURCE ?= $(ESSENTIALS_ARTIFACTS)/owinit.owx
+OWINIT_IMAGE = boot/owinit_image.owx
+OWINIT_HEADER = boot/owinit_image.h
+
+$(OWINIT_HEADER): $(OWINIT_SOURCE) tools/owx_pack.py tools/embed_owx.py \
+                   tools/cis_block.py $(CIS_STAMP)
+	python tools/embed_owx.py $(OWINIT_SOURCE) $@ --packer tools/owx_pack.py \
+	    --subsystem 0x04 --symbol g_owinit_image \
+	    --size-macro OWINIT_IMAGE_SIZE --guard OWINIT_IMAGE_GENERATED_H \
+	    $(if $(OWX_SIGN_ARGS),--pack-arg=--sign-dev,) \
+	    --note "Generated from OpenWindows-Essentials/Software/owinit/owinit.c."
+
+boot/owinit_seed.o: boot/owinit_seed.c storage/owdisk.h $(OWINIT_HEADER)
+	@mkdir -p boot
+	$(CC) $(CFLAGS) -c $< -o $@
+
+boot/owchk_seed.o: boot/owchk_seed.c storage/owdisk.h inc/ow_sentinel.h
+	@mkdir -p boot
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Emergency pair: compile to PE, pack to OWX1, embed.  Packing is its own visible
+# step (rather than hidden behind the embed tool) so that a failed import check
+# names the image that failed instead of surfacing as "header not regenerated".
+#
+# Subsystem 0x05 is OWX_SUBSYSTEM_RECOVERY, and it is the only thing that
+# distinguishes these two images at the format level.  Nothing in the kernel
+# switches on it: the survey treats all three images identically, and the
+# subsystem byte is what tells a human reading a volume which file is the
+# fallback rather than the orchestrator.
+# The dependency is on the .c, not on an intermediate .pe: tools/owx_pack.py
+# deletes the PE it consumed (the kernel's own image goes the same way, and for
+# the same reason -- a stale PE next to a fresh .owx is a trap), so a rule that
+# depended on it would rebuild the image on every single invocation.
+#
+# Spelled out per image rather than as a pattern rule: the generated header's
+# symbols are SHOUTING_SNAKE (OWINITV_IMAGE_SIZE), and there is no portable
+# Make function to upper-case a stem.  A pattern rule that quietly emitted
+# OWowinitv_IMAGE_SIZE would compile, and then fail on the first include of the
+# header -- at the include site, far from the rule that got it wrong.
+$(EMERGENCY_DIR)/owinitv.owx: $(EMERGENCY_DIR)/owinitv.c $(EMERGENCY_DIR)/ow_gate.h tools/owx_pack.py tools/cis_block.py $(CIS_STAMP)
+	$(CC) $(EMERGENCY_CFLAGS) -c $< -o $(EMERGENCY_DIR)/owinitv.o
+	$(CC) $(EMERGENCY_CFLAGS) -Wl,-e,owinitv_main -o $(EMERGENCY_DIR)/owinitv.pe $(EMERGENCY_DIR)/owinitv.o
+	python tools/owx_pack.py $(EMERGENCY_DIR)/owinitv.pe $@ --subsystem 0x05 $(OWX_SIGN_ARGS)
+
+$(EMERGENCY_DIR)/owrs.owx: $(EMERGENCY_DIR)/owrs.c $(EMERGENCY_DIR)/ow_gate.h tools/owx_pack.py tools/cis_block.py $(CIS_STAMP)
+	$(CC) $(EMERGENCY_CFLAGS) -c $< -o $(EMERGENCY_DIR)/owrs.o
+	$(CC) $(EMERGENCY_CFLAGS) -Wl,-e,owrs_main -o $(EMERGENCY_DIR)/owrs.pe $(EMERGENCY_DIR)/owrs.o
+	python tools/owx_pack.py $(EMERGENCY_DIR)/owrs.pe $@ --subsystem 0x05 $(OWX_SIGN_ARGS)
+
+$(EMERGENCY_DIR)/owinitv_image.h: $(EMERGENCY_DIR)/owinitv.owx tools/embed_owx.py
+	python tools/embed_owx.py $< $@ --no-pack \
+	    --symbol g_owinitv_image --size-macro OWINITV_IMAGE_SIZE \
+	    --guard OWINITV_IMAGE_GENERATED_H \
+	    --note "Generated from emergency/owinitv.c by tools/owx_pack.py."
+
+$(EMERGENCY_DIR)/owrs_image.h: $(EMERGENCY_DIR)/owrs.owx tools/embed_owx.py
+	python tools/embed_owx.py $< $@ --no-pack \
+	    --symbol g_owrs_image --size-macro OWRS_IMAGE_SIZE \
+	    --guard OWRS_IMAGE_GENERATED_H \
+	    --note "Generated from emergency/owrs.c by tools/owx_pack.py."
+
+boot/owinitv_seed.o: boot/owinitv_seed.c storage/owdisk.h $(EMERGENCY_DIR)/owinitv_image.h
+	@mkdir -p boot
+	$(CC) $(CFLAGS) -c $< -o $@
+
+boot/owrs_seed.o: boot/owrs_seed.c storage/owdisk.h $(EMERGENCY_DIR)/owrs_image.h
+	@mkdir -p boot
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# ==============================================================================
+# Clean & Run
+# ==============================================================================
+
+clean:
+	rm -f $(ALL_OBJS) $(PE_IMAGE) $(TARGET)
+	rm -f $(SEED_OBJS) $(EMERGENCY_OWX) $(EMERGENCY_HDRS)
+	rm -f $(EMERGENCY_DIR)/*.o $(EMERGENCY_DIR)/*.pe
+	rm -f bancode/*.o
+	rm -rf sucs/ vip/
+	rm -f storage/*.o
+	rm -f $(MANIFEST_FILE) $(MANIFEST_DIGEST)
+	@echo "Clean completed."
+
+vm: all
+	@echo "Launching OpenWindows VMM/QEMU launcher..."
+	pwsh -ExecutionPolicy Bypass -File ./run_vm.ps1
+
+# ==============================================================================
+# QEMU multiboot boot test: links the real kernel sources (boot/qboot.S +
+# boot/qemu_entry.c + ALL_OBJS) into a flat a.out-kludge multiboot image at
+# 0x100000, then boots it under QEMU and validates the ecosystem transcript.
+# Output image is kept out of the repo tree (like hosttest).
+# ==============================================================================
+QEMU_DIR = $(subst \,/,$(or $(TMPDIR),$(TEMP),/tmp))/openwinkrnl_qemu
+QEMU_BIN = $(QEMU_DIR)/openwinkrnl_qemu.bin
+
+$(QEMU_DIR)/qboot.o: boot/qboot.S
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(QEMU_DIR)/qemu_entry.o: boot/qemu_entry.c
+	@mkdir -p $(QEMU_DIR)
+	$(CC) -std=c99 -Wall -Wextra -Werror -fno-pie -g -c $< -o $@
+
+# The normal test image carries all three userspace images, so the Phase 5c survey
+# resolves to state 1 and owinit.owx is PID 1.  The emergency image (make
+# qemu-emergency) carries only the other two, which is the same kernel sources
+# with a different seed set on the link line and resolves to state 2.
+TEST_SEED_OBJS  = $(OWINIT_SEED_OBJ) $(OWINITV_SEED_OBJ) $(OWRS_SEED_OBJ) $(OWCHK_SEED_OBJ)
+EMERGENCY_SEEDS = $(OWINITV_SEED_OBJ) $(OWRS_SEED_OBJ) $(OWCHK_SEED_OBJ)
+
+$(QEMU_BIN): $(ALL_OBJS) $(TEST_SEED_OBJS) $(OWINIT_HEADER) $(EMERGENCY_HDRS) $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_image.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o $(TEST_SEED_OBJS) $(ALL_OBJS) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_image.exe $(QEMU_BIN)
+	@echo "QEMU flat multiboot image (state 1: owinit/owinitv/owrs seeded): $(QEMU_BIN)"
+
+qemu: $(QEMU_BIN)
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_run.ps1 $(QEMU_BIN)
+
+# ==============================================================================
+# QEMU emergency boot test: the SAME kernel, linked with only the emergency
+# seeds.  owinit.owx is absent from the volume, so the survey resolves to state
+# 2: owinitv.owx is entered as PID 1 and spawns owrs.owx, which prints a prompt.
+# tools/qemu_run.ps1 -Emergency asserts the state-2 transcript.
+# ==============================================================================
+QEMU_EMERG_BIN = $(QEMU_DIR)/openwinkrnl_qemu_emergency.bin
+
+$(QEMU_EMERG_BIN): $(ALL_OBJS) $(EMERGENCY_SEEDS) $(EMERGENCY_HDRS) $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_emergency_image.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o $(EMERGENCY_SEEDS) $(ALL_OBJS) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_emergency_image.exe $(QEMU_EMERG_BIN)
+	@echo "QEMU flat multiboot image (state 2: owinitv/owrs seeded): $(QEMU_EMERG_BIN)"
+
+qemu-emergency: $(QEMU_EMERG_BIN)
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_run.ps1 $(QEMU_EMERG_BIN) -Emergency
+
+# ==============================================================================
+# QEMU kernel provenance/licence regression: the real kernel, two artifacts.
+#
+# Both cases are packed by tools/owx_pack.py from the SAME kernel PE with the
+# same CORE_KERNEL policy class, source digest, and dev signature, so they are
+# byte-identical except for the licence declaration (and the signature over
+# it).  Each is embedded into its own boot/kprov_seed.c object -- which provides
+# the strong OwDiskSeedTestChk hook that writes openwinkrnl.chk + openwinkrnl.owx
+# on the test volume, and therefore links IN PLACE OF boot/owchk_seed.o -- and
+# booted through the real Phase 5c.2 provenance path:
+#
+#   control (GPL-3.0-or-later)  CIS trusts it; the boot must reach the shell
+#                               hand-off.
+#   denied  (Apache-2.0)        CIS refuses the CORE_KERNEL licence; the sentinel
+#                               reports a fatal provenance/licence failure and the
+#                               kernel halts before the shell hand-off.
+#
+# The checksum passes in BOTH cases (that is what isolates the licence verdict
+# being tested), and is computed at boot from the embedded bytes, so the fixture
+# cannot drift from the checksum it is paired with.  tools/qemu_provenance_test.ps1
+# asserts the two transcripts; qemu_run.ps1 is not used here because one case is
+# expected to halt and that script only knows the healthy transcript.
+#
+# Both cases need CIS_DEV_TRUST=1: the artifacts are signed with the development
+# key, which only a CIS_DEV_TRUST build pins in the trust store, and the seed
+# object deliberately replaces boot/owchk_seed.o.
+# ==============================================================================
+KPROV_CONTROL_DIR = $(QEMU_DIR)/kprov_control
+KPROV_DENIED_DIR  = $(QEMU_DIR)/kprov_denied
+KPROV_CONTROL_OWX = $(KPROV_CONTROL_DIR)/kprov.owx
+KPROV_DENIED_OWX  = $(KPROV_DENIED_DIR)/kprov.owx
+KPROV_CONTROL_BIN = $(QEMU_DIR)/openwinkrnl_qemu_prov_control.bin
+KPROV_DENIED_BIN  = $(QEMU_DIR)/openwinkrnl_qemu_prov_denied.bin
+KPROV_SIGN_ARGS   = --policy-class CORE_KERNEL --source-digest $(MANIFEST_DIGEST) --sign-dev
+
+# license-manifest is phony, so both artifacts are repacked on every invocation;
+# a provenance regression should test what a clean build would produce, not what
+# a previous run happened to leave behind.
+$(KPROV_CONTROL_OWX): $(PE_IMAGE) tools/owx_pack.py license-manifest
+	@mkdir -p $(KPROV_CONTROL_DIR)
+	python tools/owx_pack.py $(PE_IMAGE) $@ --subsystem $(OWX_SUBSYSTEM) \
+	    --cis-licence GPL-3.0-or-later $(KPROV_SIGN_ARGS)
+
+$(KPROV_DENIED_OWX): $(PE_IMAGE) tools/owx_pack.py license-manifest
+	@mkdir -p $(KPROV_DENIED_DIR)
+	python tools/owx_pack.py $(PE_IMAGE) $@ --subsystem $(OWX_SUBSYSTEM) \
+	    --cis-licence Apache-2.0 $(KPROV_SIGN_ARGS)
+
+$(KPROV_CONTROL_DIR)/kprov_image.h: $(KPROV_CONTROL_OWX) tools/embed_owx.py
+	@mkdir -p $(KPROV_CONTROL_DIR)
+	python tools/embed_owx.py $< $@ --no-pack --symbol g_kprov_image \
+	    --size-macro KPROV_IMAGE_SIZE --guard KPROV_IMAGE_GENERATED_H \
+	    --note "Control: CORE_KERNEL / GPL-3.0-or-later. Signed kernel artifact for the provenance regression."
+
+$(KPROV_DENIED_DIR)/kprov_image.h: $(KPROV_DENIED_OWX) tools/embed_owx.py
+	@mkdir -p $(KPROV_DENIED_DIR)
+	python tools/embed_owx.py $< $@ --no-pack --symbol g_kprov_image \
+	    --size-macro KPROV_IMAGE_SIZE --guard KPROV_IMAGE_GENERATED_H \
+	    --note "Denied: CORE_KERNEL / Apache-2.0 (violates the GPL policy). Signed kernel artifact for the provenance regression."
+
+# The header on each case's include path (via -I), not the object, is what
+# carries the case; the source is byte-identical for both.
+$(KPROV_CONTROL_DIR)/kprov_seed.o: boot/kprov_seed.c $(KPROV_CONTROL_DIR)/kprov_image.h
+	@mkdir -p $(KPROV_CONTROL_DIR)
+	$(CC) $(CFLAGS) -I$(KPROV_CONTROL_DIR) -c $< -o $@
+
+$(KPROV_DENIED_DIR)/kprov_seed.o: boot/kprov_seed.c $(KPROV_DENIED_DIR)/kprov_image.h
+	@mkdir -p $(KPROV_DENIED_DIR)
+	$(CC) $(CFLAGS) -I$(KPROV_DENIED_DIR) -c $< -o $@
+
+# Same picture as the other QEMU images, but with boot/owchk_seed.o swapped for
+# the provenance case's seed.
+$(KPROV_CONTROL_BIN): $(ALL_OBJS) boot/owinit_seed.o boot/owinitv_seed.o boot/owrs_seed.o \
+                      $(KPROV_CONTROL_DIR)/kprov_seed.o $(OWINIT_HEADER) $(EMERGENCY_HDRS) \
+                      $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_prov_control.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o \
+	    boot/owinit_seed.o boot/owinitv_seed.o boot/owrs_seed.o \
+	    $(KPROV_CONTROL_DIR)/kprov_seed.o $(ALL_OBJS) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_prov_control.exe $@
+	@echo "QEMU provenance control image (CORE_KERNEL / GPL-3.0-or-later): $@"
+
+$(KPROV_DENIED_BIN): $(ALL_OBJS) boot/owinit_seed.o boot/owinitv_seed.o boot/owrs_seed.o \
+                     $(KPROV_DENIED_DIR)/kprov_seed.o $(OWINIT_HEADER) $(EMERGENCY_HDRS) \
+                     $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_prov_denied.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o \
+	    boot/owinit_seed.o boot/owinitv_seed.o boot/owrs_seed.o \
+	    $(KPROV_DENIED_DIR)/kprov_seed.o $(ALL_OBJS) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_prov_denied.exe $@
+	@echo "QEMU provenance denied image (CORE_KERNEL / Apache-2.0): $@"
+
+ifeq ($(CIS_DEV_TRUST),1)
+qemu-provenance: $(KPROV_CONTROL_BIN) $(KPROV_DENIED_BIN)
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_provenance_test.ps1 \
+	    $(KPROV_CONTROL_BIN) $(KPROV_DENIED_BIN)
+else
+qemu-provenance:
+	@echo "qemu-provenance requires CIS_DEV_TRUST=1: the test artifacts are signed"
+	@echo "with the development key, which only a CIS_DEV_TRUST build pins in the"
+	@echo "trust store. Run: make CIS_DEV_TRUST=1 qemu-provenance"
+	@exit 1
+endif
+
+# ==============================================================================
+# QEMU argv regression: hand PID 1 a non-trivial argument vector.
+#
+# The argv block builder is unit-tested on the host (tools/hosttest/host_boot.c),
+# but that only proves the layout arithmetic.  This case proves the round trip
+# through the real CPL3 launch: boot_launch_init() calls the probe hook with a
+# vector the program did not choose, and the real shell prints what it received.
+#
+# The program under test is the actual shell, owsh.owx, built by
+# OpenWindows-Essentials.  It is seeded under OW_INIT_EXEC_NAME ("owinit.owx"),
+# so the Phase 5c survey resolves to state 1 and enters it as PID 1; the bytes on
+# the volume are the shell, the name is the init slot.  boot/owchk_seed.o still
+# supplies the kernel-integrity fixture the kernel halts without.
+#
+# Two images are linked from the same kernel sources, differing only in the probe
+# vector compiled into core/main.c (see boot_test_argv there):
+#
+#   multi   argc = 4, argv = { owsh, --probe, "hello world", "two words" }
+#   zero    argc = 0, no argv[] block at all
+# ==============================================================================
+OWARGV_DIR       = $(QEMU_DIR)/owargv
+OWARGV_ZERO_DIR  = $(QEMU_DIR)/owargv_zero
+OWARGV_IMAGE_HDR = $(OWARGV_DIR)/owargv_image.h
+OWARGV_MULTI_BIN = $(QEMU_DIR)/openwinkrnl_qemu_argv_multi.bin
+OWARGV_ZERO_BIN  = $(QEMU_DIR)/openwinkrnl_qemu_argv_zero.bin
+OWSH_IMAGE       = $(ESSENTIALS_ARTIFACTS)/owsh.owx
+
+$(OWARGV_IMAGE_HDR): $(OWSH_IMAGE) tools/owx_pack.py tools/embed_owx.py \
+                     tools/cis_block.py $(CIS_STAMP)
+	@mkdir -p $(OWARGV_DIR)
+	python tools/embed_owx.py $(OWSH_IMAGE) $@ --packer tools/owx_pack.py \
+	    --subsystem 0x04 --symbol g_owargv_image \
+	    --size-macro OWARGV_IMAGE_SIZE --guard OWARGV_IMAGE_GENERATED_H \
+	    $(if $(OWX_SIGN_ARGS),--pack-arg=--sign-dev,) \
+	    --note "OpenWindows shell (owsh.owx) seeded as PID 1 for the argv regression."
+
+$(OWARGV_DIR)/owargv_seed.o: boot/owargv_seed.c storage/owdisk.h $(OWARGV_IMAGE_HDR)
+	@mkdir -p $(OWARGV_DIR)
+	$(CC) $(CFLAGS) -I$(OWARGV_DIR) -c $< -o $@
+
+# The probe is a compile-time variant of core/main.c, not a weak symbol: the
+# Windows/PE linker does not rebind a weak alias referenced inside the defining
+# object, so a weak hook would keep calling its own definition.  Each case
+# rebuilds core/main.o with the vector baked in and links it in its place.
+$(QEMU_DIR)/main_argv_multi.o: core/main.c
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -DOW_ARGV_REGRESSION -c $< -o $@
+
+$(OWARGV_ZERO_DIR)/main_argv_zero.o: core/main.c
+	@mkdir -p $(OWARGV_ZERO_DIR)
+	$(CC) $(CFLAGS) -DOW_ARGV_REGRESSION -DOW_ARGV_REGRESSION_ZERO -c $< -o $@
+
+# boot/owchk_seed.o supplies the weak kernel-integrity fixture hook; the argv
+# seed replaces only the init image, so this is the normal seed picture minus
+# boot/owinit_seed.o and plus boot/owargv_seed.o.  core/main.o is replaced by the
+# case's probe-bearing object.
+$(OWARGV_MULTI_BIN): $(ALL_OBJS) $(OWARGV_DIR)/owargv_seed.o $(QEMU_DIR)/main_argv_multi.o \
+                     boot/owchk_seed.o $(OWARGV_IMAGE_HDR) \
+                     $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_argv_multi.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o \
+	    $(OWARGV_DIR)/owargv_seed.o $(QEMU_DIR)/main_argv_multi.o \
+	    boot/owchk_seed.o $(filter-out core/main.o,$(ALL_OBJS)) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_argv_multi.exe $@
+	@echo "QEMU argv multi image (owsh as PID 1, argc=4): $@"
+
+$(OWARGV_ZERO_BIN): $(ALL_OBJS) $(OWARGV_DIR)/owargv_seed.o $(OWARGV_ZERO_DIR)/main_argv_zero.o \
+                    boot/owchk_seed.o $(OWARGV_IMAGE_HDR) \
+                    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_argv_zero.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o \
+	    $(OWARGV_DIR)/owargv_seed.o $(OWARGV_ZERO_DIR)/main_argv_zero.o \
+	    boot/owchk_seed.o $(filter-out core/main.o,$(ALL_OBJS)) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_argv_zero.exe $@
+	@echo "QEMU argv zero image (owsh as PID 1, argc=0): $@"
+
+# kconfctl regression: same launch seam, a third program.  The vector asks the
+# real config CLI for a built-in default (see boot_test_argv).  It proves that a
+# `.owx` whose logic depends on a statically linked library and argv (not just
+# what a bare stub prints) boots, queries and reports at CPL3.
+OWKCONF_DIR       = $(QEMU_DIR)/owkconf
+OWKCONF_IMAGE_HDR = $(OWKCONF_DIR)/owkconf_image.h
+OWKCONF_BIN       = $(QEMU_DIR)/openwinkrnl_qemu_kconf.bin
+KCONFCTL_IMAGE    = $(ESSENTIALS_ARTIFACTS)/kconfctl.owx
+
+$(OWKCONF_IMAGE_HDR): $(KCONFCTL_IMAGE) tools/owx_pack.py tools/embed_owx.py \
+                      tools/cis_block.py $(CIS_STAMP)
+	@mkdir -p $(OWKCONF_DIR)
+	python tools/embed_owx.py $(KCONFCTL_IMAGE) $@ --packer tools/owx_pack.py \
+	    --subsystem 0x04 --symbol g_owkconf_image \
+	    --size-macro OWKCONF_IMAGE_SIZE --guard OWKCONF_IMAGE_GENERATED_H \
+	    $(if $(OWX_SIGN_ARGS),--pack-arg=--sign-dev,) \
+	    --note "OpenWindows configuration CLI (kconfctl.owx) seeded as PID 1 for the kconfctl regression."
+
+$(OWKCONF_DIR)/owkconf_seed.o: boot/owkconf_seed.c storage/owdisk.h $(OWKCONF_IMAGE_HDR)
+	@mkdir -p $(OWKCONF_DIR)
+	$(CC) $(CFLAGS) -I$(OWKCONF_DIR) -c $< -o $@
+
+$(OWKCONF_DIR)/owkconf_main.o: core/main.c
+	@mkdir -p $(OWKCONF_DIR)
+	$(CC) $(CFLAGS) -DOW_ARGV_REGRESSION -DOW_ARGV_REGRESSION_KCONF -c $< -o $@
+
+$(OWKCONF_BIN): $(ALL_OBJS) $(OWKCONF_DIR)/owkconf_seed.o $(OWKCONF_DIR)/owkconf_main.o \
+                boot/owchk_seed.o $(OWKCONF_IMAGE_HDR) \
+                $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_kconf.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o \
+	    $(OWKCONF_DIR)/owkconf_seed.o $(OWKCONF_DIR)/owkconf_main.o \
+	    boot/owchk_seed.o $(filter-out core/main.o,$(ALL_OBJS)) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_kconf.exe $@
+	@echo "QEMU kconfctl image (kconfctl as PID 1, query): $@"
+
+OWKCONF_SET_BIN   = $(QEMU_DIR)/openwinkrnl_qemu_kconfset.bin
+
+$(OWKCONF_DIR)/owkconfset_main.o: core/main.c
+	@mkdir -p $(OWKCONF_DIR)
+	$(CC) $(CFLAGS) -DOW_ARGV_REGRESSION -DOW_ARGV_REGRESSION_KCONFSET -c $< -o $@
+
+$(OWKCONF_SET_BIN): $(ALL_OBJS) $(OWKCONF_DIR)/owkconf_seed.o $(OWKCONF_DIR)/owkconfset_main.o \
+                boot/owchk_seed.o $(OWKCONF_IMAGE_HDR) \
+                $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_kconfset.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o \
+	    $(OWKCONF_DIR)/owkconf_seed.o $(OWKCONF_DIR)/owkconfset_main.o \
+	    boot/owchk_seed.o $(filter-out core/main.o,$(ALL_OBJS)) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_kconfset.exe $@
+	@echo "QEMU kconfctl image (kconfctl as PID 1, set+read-back): $@"
+
+# banhammer_cli regression: same launch seam, a fourth program.  The vector asks
+# the real quote CLI to select a panic quote for a fixed seed (see boot_test_argv);
+# the answer is a table lookup keyed on that seed, so the line proves argv drove a
+# real computation at CPL3 rather than a stub returning immediately.
+OWBH_DIR        = $(QEMU_DIR)/owbh
+OWBH_IMAGE_HDR  = $(OWBH_DIR)/owbh_image.h
+OWBH_BIN        = $(QEMU_DIR)/openwinkrnl_qemu_owbh.bin
+BANHAMMER_IMAGE = $(ESSENTIALS_ARTIFACTS)/banhammer_cli.owx
+
+$(OWBH_IMAGE_HDR): $(BANHAMMER_IMAGE) tools/owx_pack.py tools/embed_owx.py \
+                   tools/cis_block.py $(CIS_STAMP)
+	@mkdir -p $(OWBH_DIR)
+	python tools/embed_owx.py $(BANHAMMER_IMAGE) $@ --packer tools/owx_pack.py \
+	    --subsystem 0x04 --symbol g_owbh_image \
+	    --size-macro OWBH_IMAGE_SIZE --guard OWBH_IMAGE_GENERATED_H \
+	    $(if $(OWX_SIGN_ARGS),--pack-arg=--sign-dev,) \
+	    --note "OpenWindows Banhammer CLI (banhammer_cli.owx) seeded as PID 1 for the banhammer regression."
+
+$(OWBH_DIR)/owbh_seed.o: boot/owbh_seed.c storage/owdisk.h $(OWBH_IMAGE_HDR)
+	@mkdir -p $(OWBH_DIR)
+	$(CC) $(CFLAGS) -I$(OWBH_DIR) -c $< -o $@
+
+$(OWBH_DIR)/owbh_main.o: core/main.c
+	@mkdir -p $(OWBH_DIR)
+	$(CC) $(CFLAGS) -DOW_ARGV_REGRESSION -DOW_ARGV_REGRESSION_BANHAMMER -c $< -o $@
+
+$(OWBH_BIN): $(ALL_OBJS) $(OWBH_DIR)/owbh_seed.o $(OWBH_DIR)/owbh_main.o \
+                boot/owchk_seed.o $(OWBH_IMAGE_HDR) \
+                $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_owbh.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o \
+	    $(OWBH_DIR)/owbh_seed.o $(OWBH_DIR)/owbh_main.o \
+	    boot/owchk_seed.o $(filter-out core/main.o,$(ALL_OBJS)) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_owbh.exe $@
+	@echo "QEMU banhammer_cli image (banhammer_cli as PID 1, quote): $@"
+
+ifeq ($(CIS_DEV_TRUST),1)
+qemu-argv: $(OWARGV_MULTI_BIN) $(OWARGV_ZERO_BIN) $(OWKCONF_BIN) $(OWKCONF_SET_BIN) $(OWBH_BIN)
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_argv_test.ps1 \
+	    $(OWARGV_MULTI_BIN) $(OWARGV_ZERO_BIN) $(OWKCONF_BIN) $(OWKCONF_SET_BIN) $(OWBH_BIN)
+else
+qemu-argv:
+	@echo "qemu-argv requires CIS_DEV_TRUST=1: the shell image is signed with the"
+	@echo "development key, which only a CIS_DEV_TRUST build pins in the trust store."
+	@echo "Run: make CIS_DEV_TRUST=1 qemu-argv"
+	@exit 1
+endif
+
+# ==============================================================================
+# QEMU bancat regression: a real .owx that reads the primary OWFS volume.
+#
+# bancat reaches userspace two ways no earlier regression did: it reads a file
+# from the primary OWFS volume through the syscall gateway (OW_SYS_VFS_READ),
+# and it is admitted to a root-owned, hidden object because it runs with the
+# authority its BOOT subsystem grants.  The seeded volume carries bancat.owx as
+# OW_INIT_EXEC_NAME plus a protected crash.bdmp; the decoder prints the decoded
+# fields, and tools/qemu_bancat_test.ps1 asserts they are the fixture's exact
+# values, which can only happen if the read landed the real bytes and the
+# permission check admitted the caller.
+#
+# boot/owbancat_seed.c compiles against Extensions/bdmp_core.h (the shared
+# producer) and the embedded bancat image header, so this rule is the one place
+# that needs the Essentials include path.
+# ==============================================================================
+OWBANCAT_DIR       = $(QEMU_DIR)/bancat
+OWBANCAT_IMAGE_HDR = $(OWBANCAT_DIR)/bancat_image.h
+OWBANCAT_BIN       = $(QEMU_DIR)/openwinkrnl_qemu_bancat.bin
+BANCAT_IMAGE       = $(ESSENTIALS_ARTIFACTS)/bancat.owx
+BANCAT_BUILD_IMAGE = $(ESSENTIALS_BUILD)/Software/bancat.owx
+
+# The image embedded below is $(BANCAT_IMAGE), under the Essentials Artifacts
+# tree, but the file is produced by the Essentials CMake build in a separate
+# tree.  Stage it from that build output so `make qemu-bancat` cannot silently
+# embed a stale copy: the rule copies source over destination only when their
+# SHA-256 differ, and the qemu-bancat recipe re-verifies equality immediately
+# before booting.  If the build output does not exist there is nothing to verify
+# against, so the dedicated rule below fails with the command that produces it
+# instead of guessing a path.
+$(BANCAT_BUILD_IMAGE):
+	@echo "error: Essentials build output not found: $(BANCAT_BUILD_IMAGE)"
+	@echo "       build it with:"
+	@echo "         cmake --build \"$(ESSENTIALS_BUILD)\" --target bancat.owx"
+	@echo "       or set ESSENTIALS_BUILD to the Essentials CMake binary directory."
+	@exit 1
+
+$(BANCAT_IMAGE): $(BANCAT_BUILD_IMAGE)
+	python tools/stage_owx.py "$(BANCAT_BUILD_IMAGE)" "$@"
+
+.PHONY: stage-bancat
+stage-bancat:
+	python tools/stage_owx.py "$(BANCAT_BUILD_IMAGE)" "$(BANCAT_IMAGE)"
+
+$(OWBANCAT_IMAGE_HDR): $(BANCAT_IMAGE) tools/owx_pack.py tools/embed_owx.py \
+                       tools/cis_block.py $(CIS_STAMP)
+	@mkdir -p $(OWBANCAT_DIR)
+	python tools/embed_owx.py $(BANCAT_IMAGE) $@ --packer tools/owx_pack.py \
+	    --subsystem 0x04 --symbol g_bancat_image \
+	    --size-macro BANCAT_IMAGE_SIZE --guard BANCAT_IMAGE_GENERATED_H \
+	    $(if $(OWX_SIGN_ARGS),--pack-arg=--sign-dev,) \
+	    --note "OpenWindows bancat crash-dump decoder (bancat.owx) seeded as PID 1 for the bancat regression."
+
+$(OWBANCAT_DIR)/owbancat_seed.o: boot/owbancat_seed.c storage/owdisk.h \
+                                 $(OWBANCAT_IMAGE_HDR)
+	@mkdir -p $(OWBANCAT_DIR)
+	$(CC) $(CFLAGS) -I$(OWBANCAT_DIR) -I$(ESSENTIALS_ROOT)/Extensions -c $< -o $@
+
+$(OWBANCAT_BIN): $(ALL_OBJS) $(OWBANCAT_DIR)/owbancat_seed.o \
+                 boot/owchk_seed.o $(OWBANCAT_IMAGE_HDR) \
+                 $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(QEMU_DIR)/qemu_bancat.exe \
+	    $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o \
+	    $(OWBANCAT_DIR)/owbancat_seed.o \
+	    boot/owchk_seed.o $(ALL_OBJS) -lgcc
+	objcopy -O binary $(QEMU_DIR)/qemu_bancat.exe $@
+	@echo "QEMU bancat image (bancat as PID 1, reads crash.bdmp): $@"
+
+ifeq ($(CIS_DEV_TRUST),1)
+qemu-bancat: $(OWBANCAT_BIN)
+	python tools/stage_owx.py --verify "$(BANCAT_BUILD_IMAGE)" "$(BANCAT_IMAGE)"
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_bancat_test.ps1 $(OWBANCAT_BIN)
+else
+qemu-bancat:
+	@echo "qemu-bancat requires CIS_DEV_TRUST=1: the decoder image is signed with the"
+	@echo "development key, which only a CIS_DEV_TRUST build pins in the trust store."
+	@echo "Run: make CIS_DEV_TRUST=1 qemu-bancat"
+	@exit 1
+endif
+
+# ==============================================================================
+# VirtualBox floppy boot test: relinks the same flat kernel (boot/qboot.S +
+# boot/qemu_entry.c + ALL_OBJS) at 0x10000 via boot/vbox.ld, packs stage1.S +
+# the flat image into a 1.44MB floppy (tools/mkboot.py), and launches it in
+# VirtualBox (or prints attach/validate instructions when VBoxManage is absent).
+# All artifacts are kept out of the repo tree.
+# ==============================================================================
+VBOX_DIR = $(subst \,/,$(or $(TMPDIR),$(TEMP),/tmp))/openwinkrnl_vbox
+VBOX_STAGE1 = $(VBOX_DIR)/stage1.bin
+VBOX_KERNEL = $(VBOX_DIR)/openwinkrnl_vbox.bin
+VBOX_FLOPPY = $(VBOX_DIR)/owx_boot.flp
+
+$(VBOX_DIR)/stage1.bin: boot/stage1.S
+	@mkdir -p $(VBOX_DIR)
+	nasm -f bin -w-no-error=label-redef-late -w-label-redef-late boot/stage1.S -o $@
+
+$(VBOX_KERNEL): $(ALL_OBJS) $(TEST_SEED_OBJS) $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/vbox.ld
+	@mkdir -p $(VBOX_DIR) $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/vbox.ld" "-Wl,-e,qboot_entry" "-Wl,--image-base=0" \
+	-o $(VBOX_DIR)/vbox_image.exe \
+	$(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o $(TEST_SEED_OBJS) $(ALL_OBJS) -lgcc
+	objcopy -O binary $(VBOX_DIR)/vbox_image.exe $(VBOX_KERNEL)
+	@echo "VBox flat kernel (state 1: owinit/owinitv/owrs seeded): $@"
+
+$(VBOX_FLOPPY): $(VBOX_KERNEL) $(VBOX_DIR)/stage1.bin tools/mkboot.py
+	python tools/mkboot.py $(VBOX_DIR)/stage1.bin $(VBOX_KERNEL) $(VBOX_FLOPPY)
+
+vbox-image: $(VBOX_FLOPPY)
+
+vbox: $(VBOX_FLOPPY)
+	pwsh -ExecutionPolicy Bypass -File ./tools/vbox_run.ps1 $(VBOX_FLOPPY)
+
+# ==============================================================================
+# VirtualBox hard-disk image: PRODUCTION kernel (no owinit test seed), packed
+# behind the LBA disk boot sector (boot/stage1disk.S) into a raw image, then
+# converted to a VDI with qemu-img so it can be attached to a VirtualBox VM.
+# The "actual vdi" keeps the fatal Phase 5c owinit gate (validated by
+# vdi_run.ps1); only the QEMU/floppy test images carry the seed.
+# ==============================================================================
+QEMU_IMG  ?= qemu-img
+VDI_BYTES  = 4194304
+
+VBOX_STAGE1DISK = $(VBOX_DIR)/stage1disk.bin
+VBOX_DISK_KERNEL = $(VBOX_DIR)/openwinkrnl_disk.bin
+VBOX_DISK_RAW   = $(VBOX_DIR)/openwinkrnl_disk.img
+VBOX_VDI        = $(VBOX_DIR)/openwinkrnl.vdi
+
+$(VBOX_STAGE1DISK): boot/stage1disk.S
+	@mkdir -p $(VBOX_DIR)
+	nasm -f bin -w-no-error=label-redef-late -w-label-redef-late boot/stage1disk.S -o $@
+
+$(VBOX_DISK_KERNEL): $(ALL_OBJS) $(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o boot/vbox.ld
+	@mkdir -p $(VBOX_DIR) $(QEMU_DIR)
+	$(CC) $(CFLAGS) -nostdlib "-Wl,-T,boot/vbox.ld" "-Wl,-e,qboot_entry" "-Wl,--image-base=0" \
+	-o $(VBOX_DIR)/vbox_disk_image.exe \
+	$(QEMU_DIR)/qboot.o $(QEMU_DIR)/qemu_entry.o $(ALL_OBJS) -lgcc
+	objcopy -O binary $(VBOX_DIR)/vbox_disk_image.exe $(VBOX_DISK_KERNEL)
+	@echo "VBox disk kernel (production, no owinit seed): $@"
+
+$(VBOX_DISK_RAW): $(VBOX_DISK_KERNEL) $(VBOX_STAGE1DISK) tools/mkboot.py
+	@mkdir -p $(VBOX_DIR)
+	python tools/mkboot.py $(VBOX_STAGE1DISK) $(VBOX_DISK_KERNEL) $(VBOX_DISK_RAW) $(VDI_BYTES)
+
+$(VBOX_VDI): $(VBOX_DISK_RAW)
+	@rm -f $@
+	$(QEMU_IMG) convert -f raw -O vdi $< $@
+
+vdi: $(VBOX_VDI)
+	@echo "=============================================================================="
+	@echo "  VirtualBox hard disk ready (attach to a VM as SATA/IDE):"
+	@echo "  $@"
+	@echo "=============================================================================="
+
+vdi-test: $(VBOX_VDI)
+	pwsh -ExecutionPolicy Bypass -File ./tools/vdi_run.ps1 $(VBOX_VDI)
+
+# ==============================================================================
+# Host boot harness: runs the real kernel boot + shell on the build host.
+# (hal/htl.c is swapped for a stdio HAL; output exe is kept out of the tree.)
+# ==============================================================================
+HOSTTEST_OUT = $(or $(TMPDIR),$(TEMP),/tmp)/openwinkrnl_host.exe
+HOSTTEST_SRC = tools/hosttest/host_hal.c \
+               tools/hosttest/host_boot.c \
+               tools/hosttest/host_cis_verify.c \
+               tools/hosttest/host_cis_loader.c \
+               tools/hosttest/host_skto_name.c \
+               tools/hosttest/host_superunicode.c \
+               core/main.c core/object.c core/memory.c core/pgfault.c \
+               core/alpc.c core/runlevel.c \
+               rc/rc.c hal/acpi.c \
+               diag/bancode_krnl.c vfs/vfs.c net/router.c net/vip.c \
+sentinel/damagecntrl.c sentinel/fltrmgr.c \
+                cis/cis_core.c cis/cis_format.c cis/cis_verify.c \
+                syscall/dispatcher.c kapi/kernel64.c \
+                kapi/ow_skto_name.c shell/shell.c \
+                lib/ow_htl.c lib/kmem.c lib/kstring.c lib/kprintf.c \
+                lib/kalloc.c lib/sucs.c lib/ow_superunicode.c \
+                lib/ow_sha256.c lib/ow_sha512.c lib/ow_ed25519.c \
+                storage/owdisk.c \
+               ps/ps.c ps/switch.S ps/owx_loader.c sync/ow_sync.c dpc/ow_dpc.c \
+               kdb/kdb_core.c kdb/kdb_registry.c kdb/kdb_loader.c \
+               kdb/kdb_manager.c kdb/kdb_assoc.c kdb/kdb_bridge.c \
+               kdb/kdb_sweep.c kdb/kdb_exec.c kdb/kdb_exec_ps.c kdb/kdb_syscall.c \
+               usermode/usermode.c \
+               $(BANCODE_DIR)/bancode.c $(BANCODE_DIR)/bancode_trap.c \
+               $(SUTF_DIR)/src/sutf8.c $(SUTF_DIR)/src/sutf16.c \
+               $(SUTF_DIR)/src/sutf4.c $(SUTF_DIR)/src/sutf2.c \
+               $(SUTF_DIR)/src/sucs_mode.c \
+               $(SUAS_DIR)/src/suas/suas_sdf.c \
+               $(SUAS_DIR)/src/suas/suas_sgw.c \
+               $(SUAS_DIR)/src/suas/suas_sbr.c \
+               $(SUAS_DIR)/src/suas/suas_sucf.c \
+               $(SUAS_DIR)/src/suas/suas_ssp.c \
+               $(SUAS_DIR)/src/suas/suas_sts.c \
+               $(SUAS_DIR)/src/suas/suas_sis.c \
+               $(SUAS_DIR)/src/suas/suas_sncs.c \
+               $(SUAS_DIR)/src/suas/suas_sip.c \
+               $(SUAS_DIR)/src/suas/suas_ssre.c \
+               $(SUAS_DIR)/src/suas/suas_scms.c \
+               $(SUAS_DIR)/src/suas/suas_sucd.c \
+               $(SUAS_DIR)/src/suas/suas_sisr.c \
+               $(SUAS_DIR)/src/suas/suas_suvtl.c \
+               $(SUAS_DIR)/src/suas/suas_suamr.c \
+               $(SUAS_DIR)/src/suas/suas_sukemet.c \
+               $(SUAS_DIR)/src/suas/suas_sueasd.c \
+               $(SUAS_DIR)/src/suas/suas_skto.c \
+               $(SUAS_DIR)/src/suas/suas_stim.c \
+               $(SUAS_DIR)/src/suas/suas_sucha.c \
+               $(SUAS_DIR)/src/suas/suas_stx.c \
+               $(SUAS_DIR)/src/suas/suas_sktc.c \
+               $(SUAS_DIR)/src/suas/suas_subsystems.c \
+               $(SUAS_DIR)/src/suas/suas_core.c \
+               $(SUAS_DIR)/src/suts/suts_suca.c \
+               $(SUAS_DIR)/src/suts/suts_sre.c \
+               $(SUAS_DIR)/src/suts/suts_sldf.c \
+               $(SUAS_DIR)/src/suts/suts_sivd.c \
+               $(SUAS_DIR)/src/suts/suts_scss.c \
+               $(SUAS_DIR)/src/suts/suts_sidn.c \
+               $(SUAS_DIR)/src/suts/suts_sueps.c \
+               $(SUAS_DIR)/src/suts/suts_susch.c \
+               $(SUAS_DIR)/src/suts/suts_suldf.c \
+               $(SUAS_DIR)/src/suts/suts_susn.c \
+               $(SUAS_DIR)/src/suts/suts_scts.c \
+               $(SUAS_DIR)/src/suts/suts_scte.c \
+               $(SUAS_DIR)/src/suts/suts_suicl.c \
+               $(SUAS_DIR)/src/suts/suts_sulp.c \
+               $(SUAS_DIR)/src/suts/suts_strs.c \
+               $(SUAS_DIR)/src/suts/suts_module.c \
+               $(SUAS_DIR)/src/sutr/sutr_sucsl.c \
+               $(SUAS_DIR)/src/sutr/sutr_sueas.c \
+               $(SUAS_DIR)/src/sutr/sutr_sums.c \
+               $(SUAS_DIR)/src/sutr/sutr_sucem.c \
+               $(SUAS_DIR)/src/sutr/sutr_sucpm.c \
+               $(SUAS_DIR)/src/sutr/sutr_sumnls.c \
+               $(SUAS_DIR)/src/sutr/sutr_sucm.c \
+               $(SUAS_DIR)/src/sutr/sutr_oktp.c \
+               $(SUAS_DIR)/src/sutr/sutr_sie.c \
+               $(SUAS_DIR)/src/sutr/sutr_sfs.c \
+               $(SUAS_DIR)/src/sutr/sutr_sim.c \
+               $(SUAS_DIR)/src/sutr/sutr_skc.c \
+               $(SUST_DIR)/src/sust16.c $(SUST_DIR)/src/sustfixed.c \
+               $(SUST_DIR)/src/esust.c \
+               $(SUF_DIR)/src/suf_parser.c \
+               $(VIP_DIR)/univip_fvip.c \
+               $(STORAGE_COMMON_DIR)/src/ow_checksum.c \
+               $(STORAGE_COMMON_DIR)/src/ow_sec.c \
+               $(STORAGE_COMMON_DIR)/src/ow_crypto.c \
+               $(STORAGE_COMMON_DIR)/src/ow_string.c \
+               $(OWFS_DIR)/src/owfs_bitmap.c $(OWFS_DIR)/src/owfs_blockio.c \
+               $(OWFS_DIR)/src/owfs_blockmap.c $(OWFS_DIR)/src/owfs_catalog.c \
+               $(OWFS_DIR)/src/owfs_file.c $(OWFS_DIR)/src/owfs_format.c \
+               $(OWFS_DIR)/src/owfs_inode.c $(OWFS_DIR)/src/owfs_superblock.c \
+               $(OWFS_DIR)/src/owfs_sync.c \
+               $(USFS_DIR)/src/usfs_bitmap.c $(USFS_DIR)/src/usfs_blockio.c \
+               $(USFS_DIR)/src/usfs_entry.c $(USFS_DIR)/src/usfs_file.c \
+                $(USFS_DIR)/src/usfs_format.c $(USFS_DIR)/src/usfs_superblock.c \
+                $(USFS_DIR)/src/usfs_sync.c \
+                $(ESSENTIALS_ROOT)/DLL/kconf64/kconf64.c
+
+# hosttest-asan builds the identical source list with the address and undefined
+# behaviour sanitizers.  It exists because several CIS bounds guards cannot be
+# caught by any verdict assertion: removing one leaves the verdict unchanged (the
+# parse fails anyway, for a different reason) while turning a size subtraction
+# into an out-of-bounds read.  Only the sanitizer sees that, so the guards get
+# tested here rather than argued about in a comment.
+# -I./boot is where boot/owinit_image.h lives.  tools/hosttest/host_boot.c
+# includes it as "owinit_image.h" rather than "../../boot/owinit_image.h" so that
+# CMake can resolve the same include against its own generated copy; the two build
+# systems must therefore agree on the name, not on a relative path.
+HOSTTEST_INCLUDES = -I./boot -I./inc -I./inc/bancode -I$(BANCODE_DIR) \
+                    -I$(SUTF_DIR)/include -I$(SUAS_DIR)/include -I$(VIP_DIR) \
+                    -I$(SUST_DIR)/include \
+                    -I$(EXTSU_DIR)/include \
+                    -I$(SUF_DIR)/include \
+                    -I./build-generated/generated \
+                    -I$(STORAGE_COMMON_DIR)/include \
+                    -I$(OWFS_DIR)/include \
+                    -I$(USFS_DIR)/include \
+                    -I$(ESSENTIALS_ROOT)/Software/kconfctl \
+                    -I$(ESSENTIALS_ROOT)/Software/banhammer \
+                    -I$(ESSENTIALS_ROOT)/Extensions
+
+HOSTTEST_ASAN_FLAGS = -std=c99 -Wall -Wextra -Werror -fno-pie -g \
+                      -fsanitize=address,undefined -fno-omit-frame-pointer \
+                      -DOW_HOST_HAL $(CIS_DEV_CFLAGS) $(HOSTTEST_INCLUDES)
+HOSTTEST_ASAN_OUT = $(or $(TMPDIR),$(TEMP),/tmp)/openwinkrnl_asan.exe
+
+HOSTTEST_FLAGS = -std=c99 -Wall -Wextra -Werror -fno-pie -g -DOW_HOST_HAL \
+                 $(CIS_DEV_CFLAGS) $(HOSTTEST_INCLUDES)
+
+# Entry-point audit across all Essentials OWX targets. Runs the checker's own
+# negative self-test first, so a signature that stopped discriminating fails the
+# gate rather than silently accepting a reverted owinit.
+owx-entries:
+	python tools/check_owx_entries.py --self-test
+	python tools/check_owx_entries.py $(ESSENTIALS_ARTIFACTS)
+
+# The host harness provisions its own volume (tools/hosttest/host_boot.c), so it
+# does NOT link the seed objects -- boot/owinit_seed.o would race host_boot.c for
+# the same catalog entries.  It does depend on all three image headers, because
+# the classifier and CRC tests read the real packed bytes.
+hosttest: $(OWINIT_HEADER) $(EMERGENCY_HDRS) $(FONT_HEADER)
+	$(MAKE) owx-entries
+	$(CC) $(HOSTTEST_FLAGS) $(HOSTTEST_SRC) -o $(HOSTTEST_OUT)
+	$(HOSTTEST_OUT)
+
+# Sanitized build of the same source list.  Kept as a separate target rather than
+# folded into hosttest because the sanitizers roughly double the run time and
+# slow the edit/test loop down; run both before landing anything that touches
+# bounds arithmetic.
+hosttest-asan: $(OWINIT_HEADER) $(EMERGENCY_HDRS) $(FONT_HEADER)
+	$(CC) $(HOSTTEST_ASAN_FLAGS) $(HOSTTEST_SRC) -o $(HOSTTEST_ASAN_OUT)
+	$(HOSTTEST_ASAN_OUT)
+
+# ==============================================================================
+# Sweep standalone browser-engine suites.  These exercise the host-testable
+# Sweep modules (not the kernel image); kdb/kdb_sweep.c remains the kernel-side
+# bridge and is covered by hosttest.  Each suite keeps its own source list so a
+# missing dependency fails at link time instead of being masked by linking an
+# unrelated module.
+# ==============================================================================
+SWEEP_TEST_CFLAGS = -std=c99 -Wall -Wextra -Werror -Isweep
+SWEEP_TEST_DIR    = build-generated
+
+$(SWEEP_TEST_DIR)/sweep_engine_test.exe: sweep/sweep_engine.c \
+                                         sweep/sweep_engine.h \
+                                         sweep/tests/sweep_engine_test.c
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) sweep/sweep_engine.c \
+	    sweep/tests/sweep_engine_test.c -o $@
+
+$(SWEEP_TEST_DIR)/sweep_services_test.exe: sweep/sweep_engine.c \
+                                           sweep/sweep_services.c \
+                                           sweep/sweep_engine.h \
+                                           sweep/sweep_services.h \
+                                           sweep/tests/sweep_services_test.c
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) sweep/sweep_engine.c sweep/sweep_services.c \
+	    sweep/tests/sweep_services_test.c -o $@
+
+$(SWEEP_TEST_DIR)/sweep_text_test.exe: sweep/sweep_text.c sweep/sweep_text.h \
+                                       sweep/tests/sweep_text_test.c
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) sweep/sweep_text.c \
+	    sweep/tests/sweep_text_test.c -o $@
+
+$(SWEEP_TEST_DIR)/sweep_browser_test.exe: sweep/sweep_browser.c \
+                                          sweep/sweep_browser.h \
+                                          sweep/tests/sweep_browser_test.c
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) sweep/sweep_browser.c \
+	    sweep/tests/sweep_browser_test.c -o $@
+
+$(SWEEP_TEST_DIR)/sweep_html_test.exe: sweep/sweep_html.c sweep/sweep_html.h \
+                                       sweep/tests/sweep_html_test.c
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) sweep/sweep_html.c \
+	    sweep/tests/sweep_html_test.c -o $@
+
+$(SWEEP_TEST_DIR)/sweep_css_test.exe: sweep/sweep_html.c sweep/sweep_text.c \
+                                      sweep/sweep_engine.c sweep/sweep_css.c \
+                                      sweep/sweep_html.h sweep/sweep_text.h \
+                                      sweep/sweep_engine.h sweep/sweep_css.h \
+                                      sweep/tests/sweep_css_test.c
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) sweep/sweep_html.c sweep/sweep_text.c \
+	    sweep/sweep_engine.c sweep/sweep_css.c \
+	    sweep/tests/sweep_css_test.c -o $@
+
+# ------------------------------------------------------------------------------
+# JavaScript subsystem.  Duktape 2.7.0 is vendored as one amalgamated C file and
+# compiled with relaxed warnings (third-party code, not our -Werror surface).
+# The Sweep-side adapter, bindings, event system, text boundary and tests are
+# compiled with the normal strict flags.  This is a HOST build: Duktape needs a
+# hosted libc (malloc/realloc/free, clock), so it is deliberately not part of
+# the freestanding kernel image.
+# ------------------------------------------------------------------------------
+SWEEP_DUKTAPE_DIR    = sweep/third_party/duktape
+SWEEP_DUKTAPE_CFLAGS = -std=c99 -O2 -w -I$(SWEEP_DUKTAPE_DIR)
+
+$(SWEEP_TEST_DIR)/duktape.o: $(SWEEP_DUKTAPE_DIR)/duktape.c \
+                             $(SWEEP_DUKTAPE_DIR)/duktape.h \
+                             $(SWEEP_DUKTAPE_DIR)/duk_config.h
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_DUKTAPE_CFLAGS) -c $(SWEEP_DUKTAPE_DIR)/duktape.c -o $@
+
+$(SWEEP_TEST_DIR)/sweep_js_test.exe: sweep/sweep_js.c sweep/sweep_js_dom.c \
+                                     sweep/sweep_js_events.c \
+                                     sweep/sweep_js_text.c \
+                                     sweep/sweep_js_engine.c \
+                                     sweep/sweep_js.h sweep/sweep_js_internal.h \
+                                     sweep/sweep_js_dom.h sweep/sweep_js_events.h \
+                                     sweep/sweep_js_text.h sweep/sweep_js_engine.h \
+                                     sweep/sweep_html.c sweep/sweep_html.h \
+                                     sweep/sweep_text.c sweep/sweep_text.h \
+                                     sweep/sweep_css.c sweep/sweep_css.h \
+                                     sweep/sweep_engine.c sweep/sweep_engine.h \
+                                     sweep/tests/sweep_js_test.c \
+                                     $(SWEEP_TEST_DIR)/duktape.o
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) sweep/sweep_js.c sweep/sweep_js_dom.c \
+	    sweep/sweep_js_events.c sweep/sweep_js_text.c \
+	    sweep/sweep_js_engine.c sweep/sweep_html.c sweep/sweep_text.c \
+	    sweep/sweep_css.c sweep/sweep_engine.c \
+	    sweep/tests/sweep_js_test.c $(SWEEP_TEST_DIR)/duktape.o -o $@
+
+$(SWEEP_TEST_DIR)/sweep_document_test.exe: sweep/sweep_document.c \
+                                            sweep/sweep_document.h \
+                                            sweep/sweep_resource.c \
+                                            sweep/sweep_resource.h \
+                                            sweep/sweep_runtime.c \
+                                            sweep/sweep_runtime.h \
+                                            sweep/sweep_runtime_host.c \
+                                            sweep/sweep_js.c sweep/sweep_js_dom.c \
+                                            sweep/sweep_js_events.c \
+                                            sweep/sweep_js_text.c \
+                                            sweep/sweep_js_engine.c \
+                                            sweep/sweep_js.h sweep/sweep_js_internal.h \
+                                            sweep/sweep_js_dom.h sweep/sweep_js_events.h \
+                                            sweep/sweep_js_text.h sweep/sweep_js_engine.h \
+                                            sweep/sweep_html.c sweep/sweep_html.h \
+                                            sweep/sweep_text.c sweep/sweep_text.h \
+                                            sweep/sweep_css.c sweep/sweep_css.h \
+                                            sweep/sweep_engine.c sweep/sweep_engine.h \
+                                            sweep/tests/sweep_document_test.c \
+                                            $(SWEEP_TEST_DIR)/duktape.o
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) -I$(SUF_DIR)/include \
+	    sweep/sweep_document.c sweep/sweep_resource.c sweep/sweep_render.c \
+	    sweep/sweep_runtime.c sweep/sweep_runtime_host.c \
+	    sweep/sweep_js.c sweep/sweep_js_dom.c \
+	    sweep/sweep_js_events.c sweep/sweep_js_text.c \
+	    sweep/sweep_js_engine.c sweep/sweep_html.c sweep/sweep_text.c \
+	    sweep/sweep_css.c sweep/sweep_engine.c \
+	    $(SUF_DIR)/src/suf_parser.c \
+	    sweep/tests/sweep_document_test.c $(SWEEP_TEST_DIR)/duktape.o -o $@
+
+$(SWEEP_TEST_DIR)/sweep_resource_test.exe: sweep/sweep_resource.c sweep/sweep_resource.h \
+                                            sweep/sweep_runtime.c sweep/sweep_runtime.h \
+                                            sweep/sweep_runtime_host.c \
+                                            sweep/tests/sweep_resource_test.c
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) sweep/sweep_resource.c sweep/sweep_runtime.c \
+	    sweep/sweep_runtime_host.c \
+	    sweep/tests/sweep_resource_test.c -o $@
+
+$(SWEEP_TEST_DIR)/sweep_runtime_test.exe: sweep/sweep_runtime.c sweep/sweep_runtime.h \
+                                          sweep/sweep_runtime_host.c \
+                                          sweep/sweep_resource.c sweep/sweep_resource.h \
+                                          sweep/tests/sweep_runtime_test.c
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) sweep/sweep_runtime.c sweep/sweep_runtime_host.c \
+	    sweep/sweep_resource.c \
+	    sweep/tests/sweep_runtime_test.c -o $@
+
+
+$(SWEEP_TEST_DIR)/sweep_render_test.exe: sweep/sweep_render.c sweep/sweep_render.h \
+                                         sweep/sweep_engine.c sweep/sweep_engine.h \
+                                         sweep/sweep_html.c sweep/sweep_html.h \
+                                         sweep/sweep_text.c sweep/sweep_text.h \
+                                         sweep/sweep_css.c sweep/sweep_css.h \
+                                         $(SUF_DIR)/src/suf_parser.c \
+                                         $(SUF_DIR)/include/suf/suf_parser.h \
+                                         sweep/tests/sweep_render_test.c
+	@mkdir -p $(SWEEP_TEST_DIR)
+	$(CC) $(SWEEP_TEST_CFLAGS) -I$(SUF_DIR)/include \
+	    sweep/sweep_render.c sweep/sweep_engine.c \
+	    sweep/sweep_html.c sweep/sweep_text.c sweep/sweep_css.c \
+	    $(SUF_DIR)/src/suf_parser.c \
+	    sweep/tests/sweep_render_test.c -o $@
+
+sweep-tests: $(SWEEP_TEST_DIR)/sweep_engine_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_services_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_text_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_browser_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_html_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_css_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_js_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_document_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_resource_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_runtime_test.exe \
+             $(SWEEP_TEST_DIR)/sweep_render_test.exe
+	$(SWEEP_TEST_DIR)/sweep_engine_test.exe
+	$(SWEEP_TEST_DIR)/sweep_services_test.exe
+	$(SWEEP_TEST_DIR)/sweep_text_test.exe
+	$(SWEEP_TEST_DIR)/sweep_browser_test.exe
+	$(SWEEP_TEST_DIR)/sweep_html_test.exe
+	$(SWEEP_TEST_DIR)/sweep_css_test.exe
+	$(SWEEP_TEST_DIR)/sweep_js_test.exe
+	$(SWEEP_TEST_DIR)/sweep_document_test.exe
+	$(SWEEP_TEST_DIR)/sweep_resource_test.exe
+	$(SWEEP_TEST_DIR)/sweep_runtime_test.exe
+	$(SWEEP_TEST_DIR)/sweep_render_test.exe
+
+
+# ==============================================================================
+# Freestanding Duktape (R4).  A separate object set compiled with
+# -ffreestanding -nostdlib -fno-builtin and linked against the Sweep libc shim,
+# arena allocator and runtime seam only.  This does NOT enter the kernel image;
+# it is an isolated build/run gate for the freestanding port.
+# ==============================================================================
+SWEEP_FS_DIR      = sweep/freestanding
+SWEEP_FS_OBJ      = build-generated/freestanding
+SWEEP_FS_EXE      = $(SWEEP_FS_OBJ)/duktape_freestanding_test.exe
+SWEEP_FS_CFLAGS   = -std=c99 -O2 -Wall -Wextra -Werror -ffreestanding -nostdlib \
+                    -fno-builtin -fno-stack-protector -fno-pie -mno-stack-arg-probe \
+                    -I$(SWEEP_FS_DIR) -I$(SWEEP_DUKTAPE_DIR) -Isweep
+SWEEP_FS_DUK_CFLAGS = -std=c99 -O2 -w -ffreestanding -nostdlib -fno-builtin \
+                      -fno-stack-protector -fno-pie -mno-stack-arg-probe \
+                      -I$(SWEEP_FS_DIR) -I$(SWEEP_DUKTAPE_DIR) \
+                      -include $(SWEEP_FS_DIR)/duk_config_freestanding.h
+SWEEP_FS_HOST_CFLAGS = -std=c99 -Wall -Wextra -Werror -Isweep -I$(SWEEP_FS_DIR)
+
+SWEEP_FS_FREE_OBJS = $(SWEEP_FS_OBJ)/duktape_fs.o \
+                     $(SWEEP_FS_OBJ)/sweep_freestanding_libc.o \
+                     $(SWEEP_FS_OBJ)/sweep_fs_arena.o \
+                     $(SWEEP_FS_OBJ)/sweep_runtime_fs.o \
+                     $(SWEEP_FS_OBJ)/duktape_freestanding_smoke.o
+
+$(SWEEP_FS_OBJ)/duktape_fs.o: $(SWEEP_DUKTAPE_DIR)/duktape.c \
+                              $(SWEEP_DUKTAPE_DIR)/duktape.h \
+                              $(SWEEP_DUKTAPE_DIR)/duk_config.h \
+                              $(SWEEP_FS_DIR)/duk_config_freestanding.h
+	@mkdir -p $(SWEEP_FS_OBJ)
+	$(CC) $(SWEEP_FS_DUK_CFLAGS) -c $(SWEEP_DUKTAPE_DIR)/duktape.c -o $@
+
+$(SWEEP_FS_OBJ)/sweep_freestanding_libc.o: $(SWEEP_FS_DIR)/sweep_freestanding_libc.c \
+                                           $(SWEEP_FS_DIR)/sweep_freestanding_libc.h
+	@mkdir -p $(SWEEP_FS_OBJ)
+	$(CC) $(SWEEP_FS_CFLAGS) -c $(SWEEP_FS_DIR)/sweep_freestanding_libc.c -o $@
+
+$(SWEEP_FS_OBJ)/sweep_fs_arena.o: $(SWEEP_FS_DIR)/sweep_fs_arena.c \
+                                  $(SWEEP_FS_DIR)/sweep_fs_arena.h
+	@mkdir -p $(SWEEP_FS_OBJ)
+	$(CC) $(SWEEP_FS_CFLAGS) -c $(SWEEP_FS_DIR)/sweep_fs_arena.c -o $@
+
+$(SWEEP_FS_OBJ)/sweep_runtime_fs.o: sweep/sweep_runtime.c sweep/sweep_runtime.h
+	@mkdir -p $(SWEEP_FS_OBJ)
+	$(CC) $(SWEEP_FS_CFLAGS) -c sweep/sweep_runtime.c -o $@
+
+$(SWEEP_FS_OBJ)/duktape_freestanding_smoke.o: $(SWEEP_FS_DIR)/duktape_freestanding_smoke.c \
+                                              $(SWEEP_FS_DIR)/sweep_fs_arena.h \
+                                              sweep/sweep_runtime.h
+	@mkdir -p $(SWEEP_FS_OBJ)
+	$(CC) $(SWEEP_FS_CFLAGS) -c $(SWEEP_FS_DIR)/duktape_freestanding_smoke.c -o $@
+
+$(SWEEP_FS_OBJ)/freestanding_host_main.o: $(SWEEP_FS_DIR)/freestanding_host_main.c \
+                                          $(SWEEP_FS_DIR)/sweep_fs_arena.h \
+                                          sweep/sweep_runtime.h
+	@mkdir -p $(SWEEP_FS_OBJ)
+	$(CC) $(SWEEP_FS_HOST_CFLAGS) -c $(SWEEP_FS_DIR)/freestanding_host_main.c -o $@
+
+sweep-freestanding: $(SWEEP_FS_FREE_OBJS) $(SWEEP_FS_OBJ)/freestanding_host_main.o
+	@mkdir -p $(SWEEP_FS_OBJ)
+	$(CC) $(SWEEP_FS_HOST_CFLAGS) $(SWEEP_FS_OBJ)/freestanding_host_main.o \
+	    $(SWEEP_FS_FREE_OBJS) -o $(SWEEP_FS_EXE)
+	$(SWEEP_FS_EXE)
+	$(CC) -r -nostdlib -o $(SWEEP_FS_OBJ)/sweep_fs_bundle.o $(SWEEP_FS_FREE_OBJS)
+	@if nm -u $(SWEEP_FS_OBJ)/sweep_fs_bundle.o | grep -q .; then \
+	    echo "freestanding objects still have undefined symbols:"; \
+	    nm -u $(SWEEP_FS_OBJ)/sweep_fs_bundle.o; exit 1; \
+	else \
+	    echo "freestanding symbol closure: OK"; \
+	fi
+
+
+# Build the emergency images and audit them like any other .owx: import-free,
+# RIP-relative, entry at the real symbol.  This is the gate that catches the
+# failure mode where emergency/owrs.c grows a printf and stops being loadable.
+emergency: $(EMERGENCY_OWX)
+	python tools/check_owx_entries.py --self-test
+	python tools/check_owx_entries.py $(EMERGENCY_DIR)
+
+.PHONY: all clean vm hosttest qemu qemu-emergency qemu-provenance qemu-argv qemu-bancat vbox vbox-image vdi vdi-test \
+        owx-entries emergency sweep-tests sweep-freestanding check-external-deps \
+        qemu-sweep-kernel qemu-sweep-kapa-test qemu-sweep-kapa-runtime-test qemu-sweep-kapa-fault-test qemu-sweep-kapa-dom-test
+# ==============================================================================
+# Sweep Kernel (R1 reduced profile) - separate, independently buildable target
+# Preserves the full OpenWindows target/artifacts above. No source deletion.
+# ==============================================================================
+SWEEP_KERNEL_DIR      = build/sweep-kernel
+SWEEP_KERNEL_PE       = sweepwinkrnl.pe
+SWEEP_KERNEL_TARGET   = sweepwinkrnl.owx
+SWEEP_KERNEL_CFLAGS   = $(CFLAGS) -DOW_SWEEP_KERNEL
+SWEEP_KERNEL_LDFLAGS  = -Wl,--image-base=0x200000 -Wl,-e,_start
+
+# Explicit reduced object selection (R1): core KDB/KAPA-hosting substrate.
+# Excluded from this profile/link: vfs, storage (owdisk/owfs/usfs/common), net,
+# sentinel, shell, usermode, vip, rc runtime services. Full target unchanged.
+SWEEP_KERNEL_CORE_OBJS  = $(CORE_OBJS)
+SWEEP_KERNEL_HAL_OBJS   = $(HAL_OBJS)
+SWEEP_KERNEL_PS_OBJS    = $(PS_OBJS)
+SWEEP_KERNEL_SYNC_OBJS  = $(SYNC_OBJS)
+SWEEP_KERNEL_DPC_OBJS   = $(DPC_OBJS)
+SWEEP_KERNEL_KDB_OBJS   = $(KDB_OBJS)
+SWEEP_KERNEL_DIAG_OBJS  = $(DIAG_OBJS)
+SWEEP_KERNEL_CIS_OBJS   = $(CIS_OBJS)
+SWEEP_KERNEL_LIB_OBJS   = $(LIB_OBJS)
+SWEEP_KERNEL_BANCODE_OBJS = $(BANCODE_OBJS)
+SWEEP_KERNEL_SU_OBJS    = $(SUC_OBJS) $(SUAS_OBJS) $(SUTS_OBJS) $(SUTR_OBJS) $(SUST_OBJS) $(SUF_OBJS)
+
+SWEEP_KERNEL_BASE_OBJS  = $(SWEEP_KERNEL_CORE_OBJS) $(SWEEP_KERNEL_HAL_OBJS) \
+                          $(SWEEP_KERNEL_PS_OBJS) $(SWEEP_KERNEL_SYNC_OBJS) \
+                          $(SWEEP_KERNEL_DPC_OBJS) $(SWEEP_KERNEL_KDB_OBJS) \
+                          $(SWEEP_KERNEL_DIAG_OBJS) $(SWEEP_KERNEL_CIS_OBJS) \
+                          $(SWEEP_KERNEL_LIB_OBJS) $(SWEEP_KERNEL_BANCODE_OBJS) \
+                          $(SWEEP_KERNEL_SU_OBJS)
+SWEEP_KERNEL_OBJS       = $(addprefix $(SWEEP_KERNEL_DIR)/,$(SWEEP_KERNEL_BASE_OBJS))
+SWEEP_KERNEL_EXCLUDED_GROUPS = VFS_OBJS NET_OBJS SENT_OBJS SHELL_OBJS USERMODE_OBJS \
+                               VIP_OBJS STOR_COMMON_OBJS OWFS_OBJS USFS_OBJS STOR_CORE_OBJS RC_OBJS \
+                               SYSCALL_OBJS KAPI_OBJS
+
+$(SWEEP_KERNEL_DIR)/core/%.o: core/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/hal/%.o: hal/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/hal/%.o: hal/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/diag/%.o: diag/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/ps/%.o: ps/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/ps/%.o: ps/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/sync/%.o: sync/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/dpc/%.o: dpc/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/kdb/%.o: kdb/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/cis/%.o: cis/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/syscall/%.o: syscall/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/kapi/%.o: kapi/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/lib/%.o: lib/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/bancode/%.o: $(BANCODE_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/sucs/%.o: $(SUTF_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/suas/%.o: $(SUAS_DIR)/src/suas/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/suts/%.o: $(SUAS_DIR)/src/suts/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/sutr/%.o: $(SUAS_DIR)/src/sutr/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/sust/%.o: $(SUST_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_DIR)/suf/%.o: $(SUF_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KERNEL_PE): $(SWEEP_KERNEL_OBJS)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) $(SWEEP_KERNEL_LDFLAGS) -o $(SWEEP_KERNEL_PE) $(SWEEP_KERNEL_OBJS) -lgcc
+
+$(SWEEP_KERNEL_TARGET): $(SWEEP_KERNEL_PE) tools/owx_pack.py
+	python tools/owx_pack.py $(SWEEP_KERNEL_PE) $(SWEEP_KERNEL_TARGET) --subsystem $(OWX_SUBSYSTEM)
+	@echo "=============================================================================="
+	@echo "  Sweep Kernel (R1 reduced profile) Build Completed"
+	@echo "  Target: $(SWEEP_KERNEL_TARGET) | PE: $(SWEEP_KERNEL_PE)"
+	@echo "  Objects: $(SWEEP_KERNEL_DIR)"
+	@echo "=============================================================================="
+
+.PHONY: sweep-kernel sweep-kernel-report
+sweep-kernel: $(SWEEP_KERNEL_TARGET)
+
+sweep-kernel-report:
+	@echo "sweep-kernel target=$(SWEEP_KERNEL_TARGET) pe=$(SWEEP_KERNEL_PE) objdir=$(SWEEP_KERNEL_DIR)"
+	@echo "base_objects=$(words $(SWEEP_KERNEL_BASE_OBJS)) excluded_groups=$(words $(SWEEP_KERNEL_EXCLUDED_GROUPS))"
+
+# ------------------------------------------------------------------------------
+# Sweep KAPA self-test: reduced-profile KAPA execution (R5)
+#
+# The R5 controlled-execution evidence image is the sweep-kernel substrate
+# compiled with -DOW_SWEEP_KAPA_SELFTEST (so the boot path runs the embedded
+# KAPA payload instead of parking in the idle loop), carrying the packed KAPA
+# test image as data, and booted under the existing QEMU multiboot harness.
+# ------------------------------------------------------------------------------
+SWEEP_KAPA_DIR      = build/sweep-kapa
+SWEEP_KAPA_CFLAGS   = $(SWEEP_KERNEL_CFLAGS) -DOW_SWEEP_KAPA_SELFTEST -I$(SWEEP_KAPA_DIR)
+SWEEP_KAPA_LDFLAGS  = -Wl,-e,kapa_test_main
+SWEEP_KAPA_PE        = $(SWEEP_KAPA_DIR)/kapa_test.pe
+SWEEP_KAPA_OWX       = $(SWEEP_KAPA_DIR)/kapa_test.owx
+SWEEP_KAPA_IMAGE_H   = $(SWEEP_KAPA_DIR)/kapa_test_image.h
+SWEEP_QEMU_DIR_KAPA = $(subst \,/,$(or $(TMPDIR),$(TEMP),/tmp))/openwinkrnl_sweep_kapa
+SWEEP_QEMU_BIN_KAPA  = $(SWEEP_QEMU_DIR_KAPA)/openwinkrnl_sweep_kapa_qemu.bin
+SWEEP_KAPA_QEMU_LOG = build-generated/sweep_kapa_qemu_boot.log
+SWEEP_KAPA_BIN = $(SWEEP_QEMU_BIN_KAPA)
+
+$(SWEEP_QEMU_DIR_KAPA)/qboot.o: boot/qboot.S
+	@mkdir -p $(SWEEP_QEMU_DIR_KAPA)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_QEMU_DIR_KAPA)/qemu_entry.o: boot/qemu_entry.c
+	@mkdir -p $(SWEEP_QEMU_DIR_KAPA)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/kapa_test.o: sweep/kapa_test/kapa_test.c emergency/ow_gate.h inc/ow_syscall.h inc/ow_kdb.h
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/kapa_test.pe: $(SWEEP_KAPA_DIR)/kapa_test.o
+	$(CC) $(SWEEP_KAPA_CFLAGS) $(SWEEP_KAPA_LDFLAGS) -o $(SWEEP_KAPA_DIR)/kapa_test.pe $(SWEEP_KAPA_DIR)/kapa_test.o -lgcc
+
+$(SWEEP_KAPA_OWX): $(SWEEP_KAPA_DIR)/kapa_test.pe tools/owx_pack.py $(CIS_STAMP)
+	python tools/owx_pack.py $(SWEEP_KAPA_DIR)/kapa_test.pe $(SWEEP_KAPA_OWX) --subsystem 0x03 $(OWX_SIGN_ARGS)
+
+$(SWEEP_KAPA_IMAGE_H): $(SWEEP_KAPA_OWX) tools/embed_owx.py
+	python tools/embed_owx.py $(SWEEP_KAPA_OWX) $(SWEEP_KAPA_IMAGE_H) --no-pack \
+	    --symbol kapa_test_image --size-macro KAPA_TEST_IMAGE_SIZE \
+	    --guard OW_KAPA_TEST_IMAGE_H \
+	    --note "R5 sweep-kernel reduced-profile KAPA self-test payload"
+
+$(SWEEP_KAPA_DIR)/core/%.o: core/%.c $(SWEEP_KAPA_IMAGE_H)
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/hal/%.o: hal/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/hal/%.o: hal/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/diag/%.o: diag/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/ps/%.o: ps/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/ps/%.o: ps/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/sync/%.o: sync/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/dpc/%.o: dpc/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/kdb/%.o: kdb/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/cis/%.o: cis/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/lib/%.o: lib/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/bancode/%.o: $(BANCODE_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/sucs/%.o: $(SUTF_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/suas/%.o: $(SUAS_DIR)/src/suas/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/suts/%.o: $(SUAS_DIR)/src/suts/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/sutr/%.o: $(SUAS_DIR)/src/sutr/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/sust/%.o: $(SUST_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+$(SWEEP_KAPA_DIR)/suf/%.o: $(SUF_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -c $< -o $@
+
+SWEEP_KAPA_OBJS = $(addprefix $(SWEEP_KAPA_DIR)/,$(SWEEP_KERNEL_BASE_OBJS))
+
+$(SWEEP_KAPA_BIN): $(SWEEP_KAPA_OWX) $(SWEEP_QEMU_DIR_KAPA)/qboot.o $(SWEEP_QEMU_DIR_KAPA)/qemu_entry.o boot/qemu.ld $(SWEEP_KAPA_OBJS)
+	@mkdir -p $(SWEEP_QEMU_DIR_KAPA)
+	$(CC) $(SWEEP_KAPA_CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(SWEEP_QEMU_DIR_KAPA)/openwinkrnl_sweep_kapa_qemu.exe \
+	    $(SWEEP_QEMU_DIR_KAPA)/qboot.o $(SWEEP_QEMU_DIR_KAPA)/qemu_entry.o $(SWEEP_KAPA_OBJS) -lgcc
+	objcopy -O binary $(SWEEP_QEMU_DIR_KAPA)/openwinkrnl_sweep_kapa_qemu.exe $(SWEEP_KAPA_BIN)
+	@echo "Sweep KAPA QEMU flat multiboot image (reduced profile + KAPA selftest): $(SWEEP_KAPA_BIN)"
+
+# ------------------------------------------------------------------------------
+# Sweep KAPA runtime self-test: the actual freestanding Sweep runtime (R6)
+#
+# The R6 controlled-execution evidence image is the sweep-kernel substrate
+# compiled with -DOW_SWEEP_KAPA_RUNTIME_SELFTEST (the boot path runs the
+# embedded runtime payload instead of parking in the idle loop).  The payload
+# is the real freestanding Sweep runtime -- Duktape over SWEEP_RUNTIME, the
+# arena allocator and the libc shims, unmodified -- packaged as an OWX console
+# image and booted under the existing QEMU multiboot harness.  Entry is
+# kapa_sweep_main, the only entry contract in this profile.
+# ------------------------------------------------------------------------------
+SWEEP_OTK_DIR       = build/sweep-kapa-runtime
+SWEEP_OTK_CFLAGS    = $(SWEEP_KERNEL_CFLAGS) -DOW_SWEEP_KAPA_RUNTIME_SELFTEST -I$(SWEEP_OTK_DIR)
+SWEEP_OTK_LDFLAGS   = -Wl,-e,kapa_sweep_main
+SWEEP_OTK_PE        = $(SWEEP_OTK_DIR)/kapa_sweep.pe
+SWEEP_OTK_OWX       = $(SWEEP_OTK_DIR)/kapa_sweep.owx
+SWEEP_OTK_IMAGE_H   = $(SWEEP_OTK_DIR)/kapa_sweep_image.h
+SWEEP_OTK_APP_CFLAGS = -std=c99 -O2 -ffreestanding -nostdlib -fno-builtin \
+                      -fno-stack-protector -fpie -mno-stack-arg-probe \
+                      -fno-asynchronous-unwind-tables -Wall -Wextra \
+                      -I$(SWEEP_FS_DIR) -I$(SWEEP_DUKTAPE_DIR) -Isweep -I.
+SWEEP_OTK_DUK_CFLAGS = -std=c99 -O2 -w -ffreestanding -nostdlib -fno-builtin \
+                      -fno-stack-protector -fpie -mno-stack-arg-probe \
+                      -fno-asynchronous-unwind-tables \
+                      -I$(SWEEP_FS_DIR) -I$(SWEEP_DUKTAPE_DIR) \
+                      -include $(SWEEP_FS_DIR)/duk_config_freestanding.h
+SWEEP_OTK_QEMU_DIR  = $(subst \,/,$(or $(TMPDIR),$(TEMP),/tmp))/openwinkrnl_sweep_kapa_runtime
+SWEEP_OTK_BIN       = $(SWEEP_OTK_QEMU_DIR)/openwinkrnl_sweep_kapa_runtime_qemu.bin
+SWEEP_OTK_QEMU_LOG  = build-generated/sweep_kapa_runtime_qemu_boot.log
+SWEEP_OTK_OBJS      = $(SWEEP_OTK_DIR)/kapa_sweep.o $(SWEEP_OTK_DIR)/kapa_dom_js.o \
+                      $(SWEEP_OTK_DIR)/sweep_runtime_fs.o \
+                      $(SWEEP_OTK_DIR)/sweep_fs_arena.o $(SWEEP_OTK_DIR)/sweep_freestanding_libc.o \
+                      $(SWEEP_OTK_DIR)/duktape_fs.o \
+                      $(SWEEP_OTK_DIR)/sweep_html.o $(SWEEP_OTK_DIR)/sweep_text.o
+
+$(SWEEP_OTK_QEMU_DIR)/qboot.o: boot/qboot.S
+	@mkdir -p $(SWEEP_OTK_QEMU_DIR)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_QEMU_DIR)/qemu_entry.o: boot/qemu_entry.c
+	@mkdir -p $(SWEEP_OTK_QEMU_DIR)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/kapa_sweep.o: sweep/kapa_sweep/kapa_sweep.c sweep/sweep_runtime.h sweep/sweep_runtime.c sweep/freestanding/sweep_fs_arena.h sweep/third_party/duktape/duktape.h sweep/sweep_html.h sweep/kapa_sweep/kapa_dom_js.h sweep/kapa_sweep/kapa_dom_fixture.h emergency/ow_gate.h inc/ow_syscall.h
+	@mkdir -p $(SWEEP_OTK_DIR)
+	$(CC) $(SWEEP_OTK_APP_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/kapa_dom_js.o: sweep/kapa_sweep/kapa_dom_js.c sweep/kapa_sweep/kapa_dom_js.h sweep/sweep_html.h sweep/third_party/duktape/duktape.h
+	@mkdir -p $(SWEEP_OTK_DIR)
+	$(CC) $(SWEEP_OTK_APP_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/sweep_html.o: sweep/sweep_html.c sweep/sweep_html.h sweep/sweep_text.h
+	@mkdir -p $(SWEEP_OTK_DIR)
+	$(CC) $(SWEEP_OTK_APP_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/sweep_text.o: sweep/sweep_text.c sweep/sweep_text.h
+	@mkdir -p $(SWEEP_OTK_DIR)
+	$(CC) $(SWEEP_OTK_APP_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/sweep_runtime_fs.o: sweep/sweep_runtime.c sweep/sweep_runtime.h
+	@mkdir -p $(SWEEP_OTK_DIR)
+	$(CC) $(SWEEP_OTK_APP_CFLAGS) -c sweep/sweep_runtime.c -o $@
+
+$(SWEEP_OTK_DIR)/sweep_fs_arena.o: sweep/freestanding/sweep_fs_arena.c sweep/freestanding/sweep_fs_arena.h
+	@mkdir -p $(SWEEP_OTK_DIR)
+	$(CC) $(SWEEP_OTK_APP_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/sweep_freestanding_libc.o: sweep/freestanding/sweep_freestanding_libc.c sweep/freestanding/sweep_freestanding_libc.h
+	@mkdir -p $(SWEEP_OTK_DIR)
+	$(CC) $(SWEEP_OTK_APP_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/duktape_fs.o: sweep/third_party/duktape/duktape.c sweep/third_party/duktape/duktape.h sweep/third_party/duktape/duk_config.h sweep/freestanding/duk_config_freestanding.h
+	@mkdir -p $(SWEEP_OTK_DIR)
+	$(CC) $(SWEEP_OTK_DUK_CFLAGS) -c sweep/third_party/duktape/duktape.c -o $@
+
+$(SWEEP_OTK_DIR)/kapa_sweep.pe: $(SWEEP_OTK_OBJS)
+	$(CC) $(SWEEP_OTK_APP_CFLAGS) $(SWEEP_OTK_LDFLAGS) -pie -o $(SWEEP_OTK_PE) $(SWEEP_OTK_OBJS) -lgcc
+
+$(SWEEP_OTK_OWX): $(SWEEP_OTK_DIR)/kapa_sweep.pe tools/owx_pack.py $(CIS_STAMP)
+	python tools/owx_pack.py $(SWEEP_OTK_DIR)/kapa_sweep.pe $(SWEEP_OTK_OWX) --subsystem 0x03 $(OWX_SIGN_ARGS)
+
+$(SWEEP_OTK_IMAGE_H): $(SWEEP_OTK_OWX) tools/embed_owx.py
+	python tools/embed_owx.py $(SWEEP_OTK_OWX) $(SWEEP_OTK_IMAGE_H) --no-pack \
+	    --symbol kapa_sweep_image --size-macro KAPA_SWEEP_IMAGE_SIZE \
+	    --guard OW_KAPA_SWEEP_IMAGE_H \
+	    --note "R6 sweep-kernel reduced-profile freestanding-runtime KAPA payload"
+
+$(SWEEP_OTK_DIR)/core/%.o: core/%.c $(SWEEP_OTK_IMAGE_H)
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/hal/%.o: hal/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/hal/%.o: hal/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/diag/%.o: diag/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/ps/%.o: ps/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/ps/%.o: ps/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/sync/%.o: sync/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/dpc/%.o: dpc/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/kdb/%.o: kdb/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/cis/%.o: cis/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/lib/%.o: lib/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/bancode/%.o: $(BANCODE_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/sucs/%.o: $(SUTF_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/suas/%.o: $(SUAS_DIR)/src/suas/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/suts/%.o: $(SUAS_DIR)/src/suts/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/sutr/%.o: $(SUAS_DIR)/src/sutr/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/sust/%.o: $(SUST_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+$(SWEEP_OTK_DIR)/suf/%.o: $(SUF_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_OTK_CFLAGS) -c $< -o $@
+
+SWEEP_OTK_KERNEL_OBJS = $(addprefix $(SWEEP_OTK_DIR)/,$(SWEEP_KERNEL_BASE_OBJS))
+
+$(SWEEP_OTK_BIN): $(SWEEP_OTK_OWX) $(SWEEP_OTK_QEMU_DIR)/qboot.o $(SWEEP_OTK_QEMU_DIR)/qemu_entry.o boot/qemu.ld $(SWEEP_OTK_KERNEL_OBJS)
+	@mkdir -p $(SWEEP_OTK_QEMU_DIR)
+	$(CC) $(SWEEP_OTK_CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(SWEEP_OTK_QEMU_DIR)/openwinkrnl_sweep_kapa_runtime_qemu.exe \
+	    $(SWEEP_OTK_QEMU_DIR)/qboot.o $(SWEEP_OTK_QEMU_DIR)/qemu_entry.o $(SWEEP_OTK_KERNEL_OBJS) -lgcc
+	objcopy -O binary $(SWEEP_OTK_QEMU_DIR)/openwinkrnl_sweep_kapa_runtime_qemu.exe $(SWEEP_OTK_BIN)
+	@echo "Sweep KAPA runtime QEMU flat multiboot image (reduced profile + KAPA runtime self-test): $(SWEEP_OTK_BIN)"
+
+# ------------------------------------------------------------------------------
+# Sweep KAPA fault self-test: controlled CPL3 fault attributed to its instance
+# (R6, Workstream G).  A tiny payload that logs through the Service Bridge and
+# then deliberately dereferences the null page.  The CPL3 fault is classified
+# OW_PF_NOTMAPPED by core/pgfault.c, attributed to the live KDB binding before
+# any guard handling, and the instance ends FAULTED with resources released.
+# ------------------------------------------------------------------------------
+SWEEP_FAULT_DIR      = build/sweep-kapa-fault
+SWEEP_FAULT_CFLAGS   = $(SWEEP_KERNEL_CFLAGS) -DOW_SWEEP_KAPA_FAULT_SELFTEST -I$(SWEEP_FAULT_DIR)
+SWEEP_FAULT_LDFLAGS  = -Wl,-e,kapa_fault_main
+SWEEP_FAULT_PE       = $(SWEEP_FAULT_DIR)/kapa_fault.pe
+SWEEP_FAULT_OWX       = $(SWEEP_FAULT_DIR)/kapa_fault.owx
+SWEEP_FAULT_IMAGE_H   = $(SWEEP_FAULT_DIR)/kapa_fault_image.h
+SWEEP_FAULT_QEMU_DIR  = $(subst \,/,$(or $(TMPDIR),$(TEMP),/tmp))/openwinkrnl_sweep_kapa_fault
+SWEEP_FAULT_BIN       = $(SWEEP_FAULT_QEMU_DIR)/openwinkrnl_sweep_kapa_fault_qemu.bin
+SWEEP_FAULT_QEMU_LOG  = build-generated/sweep_kapa_fault_qemu_boot.log
+
+$(SWEEP_FAULT_QEMU_DIR)/qboot.o: boot/qboot.S
+	@mkdir -p $(SWEEP_FAULT_QEMU_DIR)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_QEMU_DIR)/qemu_entry.o: boot/qemu_entry.c
+	@mkdir -p $(SWEEP_FAULT_QEMU_DIR)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/kapa_fault.o: sweep/kapa_fault/kapa_fault.c emergency/ow_gate.h inc/ow_syscall.h inc/ow_kdb.h
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/kapa_fault.pe: $(SWEEP_FAULT_DIR)/kapa_fault.o
+	$(CC) $(SWEEP_FAULT_CFLAGS) $(SWEEP_FAULT_LDFLAGS) -o $(SWEEP_FAULT_PE) $(SWEEP_FAULT_DIR)/kapa_fault.o -lgcc
+
+$(SWEEP_FAULT_OWX): $(SWEEP_FAULT_DIR)/kapa_fault.pe tools/owx_pack.py $(CIS_STAMP)
+	python tools/owx_pack.py $(SWEEP_FAULT_DIR)/kapa_fault.pe $(SWEEP_FAULT_OWX) --subsystem 0x03 $(OWX_SIGN_ARGS)
+
+$(SWEEP_FAULT_IMAGE_H): $(SWEEP_FAULT_OWX) tools/embed_owx.py
+	python tools/embed_owx.py $(SWEEP_FAULT_OWX) $(SWEEP_FAULT_IMAGE_H) --no-pack \
+	    --symbol kapa_fault_image --size-macro KAPA_FAULT_IMAGE_SIZE \
+	    --guard OW_KAPA_FAULT_IMAGE_H \
+	    --note "R6 sweep-kernel reduced-profile KAPA fault payload"
+
+$(SWEEP_FAULT_DIR)/core/%.o: core/%.c $(SWEEP_FAULT_IMAGE_H)
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/hal/%.o: hal/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/hal/%.o: hal/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/diag/%.o: diag/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/ps/%.o: ps/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/ps/%.o: ps/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/sync/%.o: sync/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/dpc/%.o: dpc/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/kdb/%.o: kdb/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/cis/%.o: cis/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/lib/%.o: lib/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/bancode/%.o: $(BANCODE_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/sucs/%.o: $(SUTF_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/suas/%.o: $(SUAS_DIR)/src/suas/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/suts/%.o: $(SUAS_DIR)/src/suts/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/sutr/%.o: $(SUAS_DIR)/src/sutr/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/sust/%.o: $(SUST_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+$(SWEEP_FAULT_DIR)/suf/%.o: $(SUF_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -c $< -o $@
+
+SWEEP_FAULT_OBJS = $(addprefix $(SWEEP_FAULT_DIR)/,$(SWEEP_KERNEL_BASE_OBJS))
+
+$(SWEEP_FAULT_BIN): $(SWEEP_FAULT_OWX) $(SWEEP_FAULT_QEMU_DIR)/qboot.o $(SWEEP_FAULT_QEMU_DIR)/qemu_entry.o boot/qemu.ld $(SWEEP_FAULT_OBJS)
+	@mkdir -p $(SWEEP_FAULT_QEMU_DIR)
+	$(CC) $(SWEEP_FAULT_CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(SWEEP_FAULT_QEMU_DIR)/openwinkrnl_sweep_kapa_fault_qemu.exe \
+	    $(SWEEP_FAULT_QEMU_DIR)/qboot.o $(SWEEP_FAULT_QEMU_DIR)/qemu_entry.o $(SWEEP_FAULT_OBJS) -lgcc
+	objcopy -O binary $(SWEEP_FAULT_QEMU_DIR)/openwinkrnl_sweep_kapa_fault_qemu.exe $(SWEEP_FAULT_BIN)
+	@echo "Sweep KAPA fault QEMU flat multiboot image (reduced profile + fault payload): $(SWEEP_FAULT_BIN)"
+
+.PHONY: qemu-sweep-kapa-fault-test
+qemu-sweep-kapa-fault-test: $(SWEEP_FAULT_BIN)
+	@if [ "$(CIS_DEV_TRUST)" != "1" ]; then \
+	    echo "qemu-sweep-kapa-fault-test needs the R6 development-trust opt-in:"; \
+	    echo "  make qemu-sweep-kapa-fault-test CIS_DEV_TRUST=1"; \
+	    echo "Without it CIS (armed with zero trust anchors) refuses the KAPA payload,"; \
+	    echo "which is the correct default. The R4/R5 design never grants dev trust by default."; \
+	    exit 2; \
+	fi
+	@mkdir -p build-generated
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_sweep_kapa_fault_test.ps1 $(SWEEP_FAULT_BIN) $(SWEEP_FAULT_QEMU_LOG)
+
+.PHONY: qemu-sweep-kapa-dom-test
+qemu-sweep-kapa-dom-test: $(SWEEP_OTK_BIN)
+	@if [ "$(CIS_DEV_TRUST)" != "1" ]; then \
+	    echo "qemu-sweep-kapa-dom-test needs the R7 development-trust opt-in:"; \
+	    echo "  make qemu-sweep-kapa-dom-test CIS_DEV_TRUST=1"; \
+	    echo "Without it CIS (armed with zero trust anchors) refuses the KAPA payload,"; \
+	    echo "which is the correct default. The R4/R5 design never grants dev trust by default."; \
+	    exit 2; \
+	fi
+	@mkdir -p build-generated
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_sweep_kapa_dom_test.ps1 $(SWEEP_OTK_BIN) build-generated/sweep_kapa_dom_qemu_boot.log
+
+.PHONY: qemu-sweep-kapa-runtime-test
+qemu-sweep-kapa-runtime-test: $(SWEEP_OTK_BIN)
+	@if [ "$(CIS_DEV_TRUST)" != "1" ]; then \
+	    echo "qemu-sweep-kapa-runtime-test needs the R6 development-trust opt-in:"; \
+	    echo "  make qemu-sweep-kapa-runtime-test CIS_DEV_TRUST=1"; \
+	    echo "Without it CIS (armed with zero trust anchors) refuses the KAPA payload,"; \
+	    echo "which is the correct default. The R4/R5 design never grants dev trust by default."; \
+	    exit 2; \
+	fi
+	@mkdir -p build-generated
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_sweep_kapa_runtime_test.ps1 $(SWEEP_OTK_BIN) $(SWEEP_OTK_QEMU_LOG)
+
+.PHONY: qemu-sweep-kapa-test
+qemu-sweep-kapa-test: $(SWEEP_KAPA_BIN)
+	@if [ "$(CIS_DEV_TRUST)" != "1" ]; then \
+	    echo "qemu-sweep-kapa-test needs the R5 development-trust opt-in:"; \
+	    echo "  make qemu-sweep-kapa-test CIS_DEV_TRUST=1"; \
+	    echo "Without it CIS (armed with zero trust anchors) refuses the KAPA payload,"; \
+	    echo "which is the correct default. The R4 design never grants dev trust by default."; \
+	    exit 2; \
+	fi
+	@mkdir -p build-generated
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_sweep_kapa_test.ps1 $(SWEEP_KAPA_BIN) $(SWEEP_KAPA_QEMU_LOG)
+
+# ------------------------------------------------------------------------------
+# Sweep kernel QEMU multiboot boot validation (R3) - reduced profile image
+# Uses sweep-kernel objects (OW_SWEEP_KERNEL) and dedicated assertions.
+# ------------------------------------------------------------------------------
+SWEEP_QEMU_DIR = $(subst \,/,$(or $(TMPDIR),$(TEMP),/tmp))/openwinkrnl_sweep_qemu
+SWEEP_QEMU_BIN = $(SWEEP_QEMU_DIR)/openwinkrnl_sweep_qemu.bin
+SWEEP_QEMU_LOG = build-generated/sweep_kernel_qemu_boot.log
+
+$(SWEEP_QEMU_DIR)/qboot.o: boot/qboot.S
+	@mkdir -p $(SWEEP_QEMU_DIR)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_QEMU_DIR)/qemu_entry.o: boot/qemu_entry.c
+	@mkdir -p $(SWEEP_QEMU_DIR)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -c $< -o $@
+
+$(SWEEP_QEMU_BIN): $(SWEEP_KERNEL_TARGET) $(SWEEP_QEMU_DIR)/qboot.o $(SWEEP_QEMU_DIR)/qemu_entry.o boot/qemu.ld
+	@mkdir -p $(SWEEP_QEMU_DIR)
+	$(CC) $(SWEEP_KERNEL_CFLAGS) -nostdlib "-Wl,-T,boot/qemu.ld" "-Wl,-e,qboot_entry" \
+	    -o $(SWEEP_QEMU_DIR)/qemu_sweep_image.exe \
+	    $(SWEEP_QEMU_DIR)/qboot.o $(SWEEP_QEMU_DIR)/qemu_entry.o $(SWEEP_KERNEL_OBJS) -lgcc
+	objcopy -O binary $(SWEEP_QEMU_DIR)/qemu_sweep_image.exe $(SWEEP_QEMU_BIN)
+	@echo "Sweep QEMU flat multiboot image (reduced profile): $(SWEEP_QEMU_BIN)"
+
+.PHONY: qemu-sweep-kernel
+qemu-sweep-kernel: $(SWEEP_QEMU_BIN)
+	@mkdir -p build-generated
+	pwsh -ExecutionPolicy Bypass -File ./tools/qemu_sweep_kernel_test.ps1 $(SWEEP_QEMU_BIN) $(SWEEP_QEMU_LOG)

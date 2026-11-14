@@ -1,0 +1,6146 @@
+/*
+ * host_boot.c - Host boot harness for openwinkrnl.owx
+ *
+ * Executes the same boot sequence as core/main.c::_start, then drives
+ * the Ring-0 debug shell through scripted host UART input and validates
+ * the resulting transcript.
+ *
+ * Host file access deliberately avoids:
+ *   fopen / fread / fseek / ftell
+ *   strcpy / strlen / strstr
+ *   malloc / free
+ *   snprintf
+ *
+ * Windows uses _sopen_s/_read/_close.
+ * POSIX hosts use open/read/close.
+ */
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#include "../../cis/cis_keys.h"
+#include "../../inc/ow_alpc.h"
+#include "../../inc/ow_cis.h"
+#include "../../inc/ow_cis_format.h"
+#include "../../inc/ow_diag.h"
+#include "../../inc/ow_ed25519.h"
+#include "../../inc/ow_ed25519_test.h"
+#include "../../inc/ow_sha512.h"
+#include "crypto_vectors.h"
+#include "cis_fixtures.h"
+
+/* Implemented in host_cis_verify.c.  Returns that file's failure count, which
+ * main() adds to its own tally; the two files keep separate counters so a
+ * mismatch between them is visible rather than averaged away. */
+int test_cis_verify_run(int* out_passed);
+/* Implemented in host_cis_loader.c.  Same counter discipline: its failure count
+ * is added to main()'s, never folded into it. */
+int test_cis_loader_run(int* out_passed);
+/* Implemented in host_skto_name.c.  SKTO name admission at the syscall
+ * gateway's kernel boundary (SUAS-018). */
+int test_skto_name_run(int* out_passed);
+int test_superunicode_run(int* out_passed);
+
+#include "../../inc/ow_ecosys.h"
+#include "../../inc/ow_hal.h"
+#include "../../inc/ow_kdb.h"
+#include "../../kdb/kdb_internal.h"
+#include "../../inc/ow_kprintf.h"
+/* Resolved on the include path, not by relative path: the generated header
+ * lives in the build tree -- boot/ under the Makefile, <build>/generated under
+ * CMake.  Naming that directory here would bind one build system's layout into
+ * a source file both of them need. */
+#include "owinit_image.h"
+#include "../../inc/ow_memory.h"
+#include "../../inc/ow_net.h"
+#include "../../inc/ow_object.h"
+#include "../../inc/ow_owx.h"
+#include "../../inc/ow_ps.h"
+#include "../../inc/ow_runlevel.h"
+#include "../../inc/ow_sentinel.h"
+#include "../../inc/ow_shell.h"
+#include "../../inc/ow_syscall.h"
+#include "../../inc/ow_userspace.h"
+#include "../../inc/ow_vfs.h"
+#include "../../lib/kalloc.h"
+#include "../../emergency/owinitv_image.h"
+#include "../../emergency/owrs_image.h"
+#include "../../inc/ow_types.h"
+#include "../../inc/ow_vfs.h"
+#include "../../storage/owdisk.h"
+#include "kconfctl_core.h"
+#include "banhammer_cli_core.h"
+/* The crash-dump producer/validator, the same header the kernel seeder and
+ * bancat include, so the harness tests the one definition rather than a copy. */
+#include "bdmp_core.h"
+/* The OWFS permission model and its on-disk flag/error names, so the harness can
+ * assert that a restricted object is refused to a non-owner by the real checks. */
+#include "ow_sec.h"
+#include "owfs_types.h"
+#include "sucs_mode.h"
+
+#include <stdio.h>
+#include <string.h>
+#include "../../inc/ow_ed25519.h"
+#include "../../inc/ow_ed25519_test.h"
+#include "../../inc/ow_sha512.h"
+#include "crypto_vectors.h"
+
+/* -------------------------------------------------------------------------
+ */
+/* Host HAL */
+/* -------------------------------------------------------------------------
+ */
+
+char *HostHalOutput(void);
+size_t HostHalOutputLen(void);
+void HostHalSetInputScript(const char *script);
+
+/* ------------------------------------------------------------------------- */
+/* Harness state                                                              */
+/* ------------------------------------------------------------------------- */
+
+static const char *g_script = "exit\n";
+
+static int g_failures = 0;
+static int g_passed = 0;
+
+/* How many trust anchors this build pins before the harness injects any: zero in
+ * a default build, one dev anchor under CIS_DEV_TRUST.  Captured once from the
+ * live count so the assertions that depend on it do not have to repeat the
+ * conditional, and so none of them can silently assume the default build. */
+static unsigned long g_CisHarnessPinned = 0UL;
+
+/* ------------------------------------------------------------------------- */
+/* Tiny local string helpers                                                  */
+/* ------------------------------------------------------------------------- */
+
+static size_t ow_strlen(const char *text) {
+  size_t length = 0;
+
+  if (text == NULL)
+    return 0;
+
+  while (text[length] != '\0')
+    ++length;
+
+  return length;
+}
+
+/*
+ * Bounded string copy.
+ *
+ * Returns true when the complete string fitted.
+ * Returns false when truncation would have occurred.
+ */
+static bool ow_strcopy(char *destination, size_t destination_size,
+                       const char *source) {
+  size_t i;
+
+  if (destination == NULL || source == NULL || destination_size == 0) {
+    return false;
+  }
+
+  for (i = 0; i + 1 < destination_size && source[i] != '\0'; ++i) {
+    destination[i] = source[i];
+  }
+
+  destination[i] = '\0';
+
+  return source[i] == '\0';
+}
+
+/*
+ * Small byte-copy helper.
+ *
+ * Used instead of strcpy/memcpy for the tiny host-side buffers here.
+ */
+static void ow_copy_bytes(uint8_t *destination, const uint8_t *source,
+                          size_t count) {
+  size_t i;
+
+  if (destination == NULL || source == NULL)
+    return;
+
+  for (i = 0; i < count; ++i)
+    destination[i] = source[i];
+}
+
+/* ------------------------------------------------------------------------- */
+/* Local substring search                                                     */
+/* ------------------------------------------------------------------------- */
+
+static const char *ow_strfind(const char *haystack, const char *needle) {
+  size_t needle_length;
+  size_t i;
+
+  if (haystack == NULL || needle == NULL)
+    return NULL;
+
+  needle_length = ow_strlen(needle);
+
+  if (needle_length == 0)
+    return haystack;
+
+  for (i = 0; haystack[i] != '\0'; ++i) {
+    size_t j;
+
+    for (j = 0; j < needle_length; ++j) {
+      if (haystack[i + j] == '\0')
+        break;
+
+      if (haystack[i + j] != needle[j])
+        break;
+    }
+
+    if (j == needle_length)
+      return &haystack[i];
+  }
+
+  return NULL;
+}
+
+static size_t count_occ(const char *haystack, const char *needle) {
+  size_t count = 0;
+  size_t needle_length;
+  const char *current;
+
+  if (haystack == NULL || needle == NULL)
+    return 0;
+
+  needle_length = ow_strlen(needle);
+
+  if (needle_length == 0)
+    return 0;
+
+  current = haystack;
+
+  while ((current = ow_strfind(current, needle)) != NULL) {
+    ++count;
+    current += needle_length;
+  }
+
+  return count;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Transcript verification                                                    */
+/* ------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
+/* User-window address validation: alignment split (regression)              */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Two predicates with deliberately different contracts, kept apart on purpose:
+ *
+ *   OwMemIsUserWindow()  page-granular. True only for a page BASE that lies
+ *                        inside the window.  Required wherever the address
+ *                        names a mapping or a VAD endpoint, because those are
+ *                        always page-aligned by construction.
+ *
+ *   OwMemInUserWindow()  address-level. True for ANY byte address inside the
+ *                        window.  Required for real instruction/data
+ *                        addresses, which are routinely mid-page.
+ *
+ * Regression history: the entry point of a relocated OWX image is mid-page
+ * (image base + the entry RVA), and a thread's initial RSP sits just under a
+ * page top.  Both are legal.  When the page-aligned predicate was applied to
+ * them, a correct image was rejected as "outside window" -- and once the
+ * stricter check was bypassed for the entry, the two predicates were easy to
+ * confuse again in review.  These cases pin both contracts down.
+ */
+static void check_window(const char *label, bool got, bool want) {
+  if (got == want) {
+    ++g_passed;
+    printf("[PASS] %s = %s\n", label, want ? "true" : "false");
+  } else {
+    ++g_failures;
+    printf("[FAIL] %s: got %s, want %s\n", label, got ? "true" : "false",
+           want ? "true" : "false");
+  }
+}
+
+/* Defined further down beside the other numeric helper; declared here so the
+ * suites above it can compare integers without depending on definition order. */
+static void check_eq(const char *label, unsigned long got, unsigned long want);
+
+/* -------------------------------------------------------------------- */
+/* .bdmp crash-dump producer and validator                               */
+/* -------------------------------------------------------------------- */
+/* bancat decodes whatever bdmp_build produced, and both sides include the same
+ * Extensions/bdmp_core.h.  That makes this suite the place to hold the format
+ * down from both ends at once: the producer emits a dump the validator accepts,
+ * and every single-field corruption the validator is supposed to catch is
+ * introduced here and shown to be caught.  A validator tested only against its
+ * own happy-path output proves the two halves of one header agree with each
+ * other, not that either agrees with the format. */
+static void test_bdmp_core(void) {
+  static uint8_t dump[1024];
+  uint8_t mem[32];
+  bdmp_cpu_frame_t frame;
+  bdmp_trap_record_t traps[2];
+  uint32_t total;
+  uint32_t i;
+
+  printf("\n=== .bdmp crash-dump producer/validator ===\n");
+
+  for (i = 0; i < (uint32_t)sizeof(mem); ++i) {
+    mem[i] = (uint8_t)(0xA0u + i);
+  }
+
+  memset(&frame, 0, sizeof(frame));
+  frame.rax = 0x1122334455667788ULL;
+  frame.rip = 0x0000000000401234ULL;
+  frame.rsp = 0x000000000041FF00ULL;
+  frame.rcx = 3u;
+
+  memset(traps, 0, sizeof(traps));
+  traps[0].bancode = 0x0000BADCu;
+  traps[0].trap_slot = 3u;
+  traps[0].context_ip = 0x0000000000401230ULL;
+  traps[1].bancode = 0x0000BADCu;
+  traps[1].trap_slot = 1u;
+  traps[1].context_ip = 0x00000000004011F0ULL;
+
+  total = bdmp_build(dump, (uint32_t)sizeof(dump), &frame, traps, 2u,
+                     0x0000BADCu, 0u, 0x0000000000001234ULL,
+                     0x0000000000000000ULL, mem, (uint32_t)sizeof(mem));
+
+  /* 256 header + 176 frame + 2*24 traps = 480, aligned, + 32 memory = 512. */
+  check_eq("producer returns the exact body-derived size", (unsigned long)total,
+           512ul);
+  check_window("a produced dump validates", bdmp_validate(dump, total), true);
+
+  {
+    const bdmp_header_t *h = (const bdmp_header_t *)(const void *)dump;
+    check_eq("header magic survives the producer",
+             (unsigned long)h->magic, (unsigned long)BDMP_MAGIC);
+    check_eq("header format version",
+             (unsigned long)h->format_version,
+             (unsigned long)BDMP_FORMAT_VERSION);
+    check_eq("dump_size equals the produced size",
+             (unsigned long)h->dump_size, (unsigned long)total);
+    check_eq("trap_count is recorded", (unsigned long)h->trap_count, 2ul);
+    check_eq("memory_dump_offset is the aligned trap-table end",
+             (unsigned long)h->memory_dump_offset, 480ul);
+    check_eq("memory_dump_size is exactly the input size",
+             (unsigned long)h->memory_dump_size, (unsigned long)sizeof(mem));
+  }
+
+  /* The dump's CRC32c and the kernel VFS's must be the same function over the
+   * same bytes.  The host build already pins the OWX loader's CRC to
+   * OwFsChecksumCalc; this closes the same loop for the crash-dump format. */
+  check_window("bdmp_crc32c agrees with OwFsChecksumCalc over the whole dump",
+               bdmp_crc32c(dump, total) == OwFsChecksumCalc(dump, total), true);
+
+  /* ---- Malformed variants, each introduced into a pristine copy --------- */
+  {
+    uint8_t bad[1024];
+    const bdmp_header_t *h;
+    uint32_t hdr_crc_off;
+
+    memcpy(bad, dump, total);
+
+    check_window("a buffer one byte short is refused", bdmp_validate(bad, total - 1u),
+                 false);
+    check_window("a header-only buffer is refused", bdmp_validate(bad, 255u), false);
+    check_window("a NULL buffer is refused", bdmp_validate(NULL, total), false);
+
+    h = (const bdmp_header_t *)(const void *)bad;
+
+    memcpy(bad, dump, total);
+    ((bdmp_header_t *)(void *)bad)->magic = 0u;
+    check_window("a wrong magic is refused", bdmp_validate(bad, total), false);
+
+    memcpy(bad, dump, total);
+    ((bdmp_header_t *)(void *)bad)->trap_count = 99u; /* > BDMP_MAX_TRAPS */
+    check_window("trap_count past the maximum is refused", bdmp_validate(bad, total),
+                 false);
+
+    memcpy(bad, dump, total);
+    ((bdmp_header_t *)(void *)bad)->memory_dump_offset = 0u;
+    check_window("a memory region overlapping the header is refused",
+                 bdmp_validate(bad, total), false);
+
+    memcpy(bad, dump, total);
+    ((bdmp_header_t *)(void *)bad)->memory_dump_size = total + 1u;
+    check_window("a memory region running past the dump is refused",
+                 bdmp_validate(bad, total), false);
+
+    /* Flip a byte inside a checksum-covered field but outside the checksum
+     * windows' self-reference: the header checksum no longer matches. */
+    memcpy(bad, dump, total);
+    hdr_crc_off = 0x10u; /* primary_bancode, first covered byte */
+    bad[hdr_crc_off] ^= 0xFFu;
+    check_window("a corrupted covered header byte fails the header checksum",
+                 bdmp_validate(bad, total), false);
+
+    /* Flip a body byte: header checksum still holds, dump checksum does not. */
+    memcpy(bad, dump, total);
+    bad[BDMP_TRAP_TABLE_OFFSET + 1u] ^= 0xFFu;
+    check_window("a corrupted body byte fails the dump checksum",
+                 bdmp_validate(bad, total), false);
+
+    memcpy(bad, dump, total);
+    ((bdmp_header_t *)(void *)bad)->header_checksum ^= 0x1u;
+    check_window("a wrong stored header checksum is refused",
+                 bdmp_validate(bad, total), false);
+
+    memcpy(bad, dump, total);
+    ((bdmp_header_t *)(void *)bad)->dump_checksum ^= 0x1u;
+    check_window("a wrong stored dump checksum is refused",
+                 bdmp_validate(bad, total), false);
+
+    (void)h;
+  }
+
+  /* ---- Producer refusals ------------------------------------------------- */
+  check_eq("producer refuses a cap smaller than the dump",
+           (unsigned long)bdmp_build(dump, 16u, &frame, traps, 2u, 0u, 0u, 0u,
+                                     0u, mem, (uint32_t)sizeof(mem)),
+           0ul);
+  check_eq("producer refuses more traps than the format allows",
+           (unsigned long)bdmp_build(dump, (uint32_t)sizeof(dump), &frame, traps,
+                                     99u, 0u, 0u, 0u, 0u, mem,
+                                     (uint32_t)sizeof(mem)),
+           0ul);
+  check_eq("producer refuses a missing register frame",
+           (unsigned long)bdmp_build(dump, (uint32_t)sizeof(dump), NULL, traps,
+                                     2u, 0u, 0u, 0u, 0u, mem,
+                                     (uint32_t)sizeof(mem)),
+           0ul);
+}
+
+/* -------------------------------------------------------------------- */
+/* OWFS hidden / restricted read permissions                             */
+/* -------------------------------------------------------------------- */
+/* The syscall read path (OW_SYS_VFS_READ) is only as strong as the OWFS check it
+ * leans on, so this suite pins that check directly at the storage layer: a
+ * root-owned OWFS_SEC_HIDDEN object must be unspeakable by a non-root caller,
+ * and a root-owned mode-0600 object must be named but denied.  OwFsOwfsCreateRestricted
+ * is what the crash-dump seeder uses, so a regression here is a regression in
+ * what bancat is allowed to read.  Runs after OwDiskInitialize, on the real
+ * mounted volume. */
+static void test_owfs_read_permissions(void) {
+  static uint8_t buf[64];
+  ow_identity_t saved;
+  ow_identity_t user;
+  uint32_t got;
+  OW_STATUS st;
+
+  printf("\n=== OWFS hidden/restricted read permissions ===\n");
+
+  saved = ow_sec_current(); /* the superuser, by default */
+
+  /* Root-owned, mode 0600, hidden -- the crash-dump protection exactly. */
+  st = OwFsOwfsCreateRestricted(
+      "permhidden.dat",
+      (uint16_t)(OWFS_MODE_OWNER_READ | OWFS_MODE_OWNER_WRITE),
+      (uint8_t)OWFS_SEC_HIDDEN, (const uint8_t *)"secret", 6u);
+  check_window("a root 0600 hidden file is created", ow_status_success(st), true);
+
+  /* Root-owned, mode 0600, NOT hidden -- nameable, but not readable. */
+  st = OwFsOwfsCreateRestricted(
+      "permpriv.dat",
+      (uint16_t)(OWFS_MODE_OWNER_READ | OWFS_MODE_OWNER_WRITE), 0u,
+      (const uint8_t *)"private", 7u);
+  check_window("a root 0600 unhidden file is created", ow_status_success(st), true);
+
+  user.uid = 1000u;
+  user.gid = 1000u;
+
+  ow_sec_set_identity(&user);
+  got = 0u;
+  st = OwFsOwfsReadOffset("permhidden.dat", buf, 0u, (uint32_t)sizeof(buf), &got);
+  check_eq("a non-root caller cannot even name the hidden file",
+           (unsigned long)st, (unsigned long)OWFS_ERR_NOT_FOUND);
+
+  got = 0u;
+  st = OwFsOwfsReadOffset("permpriv.dat", buf, 0u, (uint32_t)sizeof(buf), &got);
+  check_eq("a non-root caller is denied a 0600 file by its access check",
+           (unsigned long)st, (unsigned long)OWFS_ERR_ACCESS_DENIED);
+
+  ow_sec_set_identity(&saved); /* back to the superuser */
+
+  got = 0u;
+  st = OwFsOwfsReadOffset("permhidden.dat", buf, 0u, (uint32_t)sizeof(buf), &got);
+  check_window("the owner (superuser) reads the hidden file",
+               ow_status_success(st), true);
+  check_eq("the hidden file returns its exact length", (unsigned long)got, 6ul);
+  check_window("the hidden file returns its exact bytes",
+               memcmp(buf, "secret", 6u) == 0, true);
+
+  got = 0u;
+  st = OwFsOwfsReadOffset("permpriv.dat", buf, 0u, (uint32_t)sizeof(buf), &got);
+  check_window("the owner reads the 0600 file", ow_status_success(st), true);
+  check_eq("the private file returns its exact length", (unsigned long)got, 7ul);
+  check_window("the private file returns its exact bytes",
+               memcmp(buf, "private", 7u) == 0, true);
+
+  ow_sec_set_identity(&saved);
+}
+
+/* -------------------------------------------------------------------- */
+/* Import rejection (regression)                                         */
+/* -------------------------------------------------------------------- */
+/* OWX1 has no import entry structure, no import table and no relocation
+ * table, so the loader cannot bind an imported symbol; it rejects any image
+ * that declares one via OwOwxImageIsSelfContained().
+ *
+ * This matters because the failure it replaces was silent and misleading.  An
+ * image whose imports were never bound still loads: its IAT slots hold RVAs
+ * into its own hint/name table rather than callable addresses, the uniform
+ * load bias cannot repair that, and the process only faults much later, at
+ * CPL3, on its first call through one of those slots.  The fault address points
+ * nowhere near the cause.  Rejecting at load time reports the actual problem.
+ *
+ * The cases below pin both halves of that contract: the predicate refuses a
+ * declared import, and the owinit image the kernel actually ships is genuinely
+ * self-contained.  The second half is the one that regressed: owinit.owx
+ * imported kconf64_init and kconf64_get_string, and the packer reported
+ * import_count = 0 regardless while discarding .idata, so the image claimed to
+ * be self-contained and was not. */
+static void test_import_rejection(void) {
+  owx_header_t probe;
+  const owx_header_t *shipped = (const owx_header_t *)(const void *)g_owinit_image;
+
+  printf("\n=== Import rejection ===\n");
+
+  memset(&probe, 0, sizeof(probe));
+  probe.magic = OWX_MAGIC;
+  probe.import_count = 0u;
+  check_window("OwOwxImageIsSelfContained(import_count=0)", OwOwxImageIsSelfContained(&probe), true);
+
+  probe.import_count = 1u;
+  check_window("OwOwxImageIsSelfContained(import_count=1)", OwOwxImageIsSelfContained(&probe), false);
+
+  probe.import_count = 2u;
+  check_window("OwOwxImageIsSelfContained(import_count=2)", OwOwxImageIsSelfContained(&probe), false);
+
+  check_window("OwOwxImageIsSelfContained(NULL)", OwOwxImageIsSelfContained(NULL), false);
+
+  /* The real artifact.  owinit_main calls kconf64_init and
+   * kconf64_get_string, so this fails the moment kconf64 stops being linked
+   * into owinit.owx -- which is the point: it must be resolved at link time,
+   * not at load time, because nothing in the kernel can resolve it. */
+  if (OWINIT_IMAGE_SIZE < sizeof(owx_header_t)) {
+    check_window("shipped owinit image is large enough for a header", false, true);
+  } else {
+    check_window("shipped owinit image is large enough for a header", true, true);
+    check_window("shipped owinit image declares no imports",
+                 OwOwxImageIsSelfContained(shipped), true);
+    if (shipped->import_count != 0u) {
+      printf("       shipped image declares %u import(s)\n",
+             (unsigned)shipped->import_count);
+    }
+  }
+}
+
+/* -------------------------------------------------------------------- */
+/* Entry point is the real owinit_main, not the stub (regression)         */
+/* -------------------------------------------------------------------- */
+/* The stub and the real function are both "an .owx entry that returns", so
+ * proving the launch path works does not tell you which one ran.  Until the
+ * entry was repointed, every CPL3 result was satisfied by `xor eax,eax; ret`
+ * -- and a test that only asserts "the entry stub ran" would keep passing if
+ * the entry silently reverted, which is precisely the regression worth
+ * catching.
+ *
+ * This checks the shipped image itself rather than trusting the link:
+ *   - the entry must fall inside a section the packer typed as CODE, since
+ *     a data or BSS entry would fault on NX and mean nothing else;
+ *   - the first three bytes at the entry must not be owx_entry_stub's
+ *     `xor eax,%eax; ret` (31 C0 C3).
+ * Together those say the entry is real executable code that is not the stub.
+ *
+ * The two classifiers below are factored out so they can be unit tested in
+ * band: a signature check that silently stopped matching would otherwise let a
+ * reverted owinit pass unnoticed, which is the exact failure this guards. */
+static int bytes_are_entry_stub(const unsigned char *p) {
+  return (p[0] == 0x31u && p[1] == 0xC0u && p[2] == 0xC3u);
+}
+
+/* owinit_main opens with the MS x64 frame setup `sub $0x28,%rsp`
+ * (48 83 EC 28) followed by a direct relative call (E8) to kconf64_init.
+ * Asserting the call opcode too means an unrelated 3-byte stack adjustment
+ * cannot masquerade as the real entry. */
+static int bytes_are_owinit_main(const unsigned char *p) {
+  return (p[0] == 0x48u && p[1] == 0x83u && p[2] == 0xECu &&
+          p[3] == 0x28u && p[4] == 0xE8u);
+}
+
+static void test_entry_classifiers(void) {
+  /* Both prologues as they actually link today, captured from the shipped
+   * images rather than transcribed by hand. */
+  static const unsigned char stub[8] = {0x31, 0xC0, 0xC3, 0x90, 0x90,
+                                        0x90, 0x90, 0x90};
+  static const unsigned char real[8] = {0x48, 0x83, 0xEC, 0x28, 0xE8,
+                                        0xF7, 0x04, 0x00};
+
+  printf("\n=== Entry signature classifiers (negative self-test) ===\n");
+
+  check_window("stub classifier accepts xor eax,eax; ret",
+               bytes_are_entry_stub(stub) == 1, true);
+  check_window("stub classifier rejects owinit_main's prologue",
+               bytes_are_entry_stub(real) == 0, true);
+  check_window("owinit_main classifier accepts sub rsp,0x28; call",
+               bytes_are_owinit_main(real) == 1, true);
+  check_window("owinit_main classifier rejects the stub",
+               bytes_are_owinit_main(stub) == 0, true);
+}
+
+static void test_entry_is_owinit_main(void) {
+  const owx_header_t *h = (const owx_header_t *)(const void *)g_owinit_image;
+  const owx_section_entry_t *secs;
+  const unsigned char *img = g_owinit_image;
+  uint64_t entry = 0;
+  int32_t hit = -1;
+
+  printf("\n=== Entry point identity ===\n");
+
+  if (OWINIT_IMAGE_SIZE < sizeof(owx_header_t)) {
+    check_window("image large enough for an OWX header", false, true);
+    return;
+  }
+  check_window("image large enough for an OWX header", true, true);
+
+  if (h->section_table_offset == 0u ||
+      h->section_count == 0u || h->section_count > OWX_MAX_SECTIONS) {
+    check_window("section table is usable", false, true);
+    return;
+  }
+  check_window("section table is usable", true, true);
+
+  entry = h->entry_point;
+  secs = (const owx_section_entry_t *)(const void *)(img + h->section_table_offset);
+
+  for (uint32_t i = 0; i < h->section_count; ++i) {
+    if (entry >= secs[i].virtual_addr &&
+        entry < secs[i].virtual_addr + secs[i].size) {
+      hit = (int32_t)i;
+      break;
+    }
+  }
+
+  check_window("entry lies inside a section", hit >= 0, true);
+  check_window("entry section is typed CODE",
+               hit >= 0 && secs[hit].type == OWX_SECTION_CODE, true);
+
+  /* The RVA comes from the header's own preferred_base rather than a constant
+   * baked into this test, so a base change cannot silently shift the target. */
+  if (h->preferred_base != 0u && entry > h->preferred_base) {
+    uint64_t rva = entry - h->preferred_base;
+    printf("       entry rva: 0x%llX (base 0x%llX)\n",
+           (unsigned long long)rva, (unsigned long long)h->preferred_base);
+    check_window("entry RVA is 0x1000 (owinit_main)", rva == 0x1000u, true);
+  } else {
+    check_window("entry RVA is 0x1000 (owinit_main)", false, true);
+  }
+
+  if (hit >= 0) {
+    const owx_section_entry_t *sec = &secs[hit];
+    uint64_t delta = entry - sec->virtual_addr;
+    uint64_t off = sec->file_offset + delta;
+    const unsigned char *p;
+
+    if (off + 8u > OWINIT_IMAGE_SIZE) {
+      check_window("entry instruction is inside the image file", false, true);
+      return;
+    }
+    check_window("entry instruction is inside the image file", true, true);
+
+    p = img + off;
+    printf("       entry bytes:");
+    for (unsigned k = 0; k < 8u; ++k) printf(" %02X", p[k]);
+    printf("\n");
+
+    check_window("entry is not owx_entry_stub (xor eax,eax; ret)",
+                 !bytes_are_entry_stub(p), true);
+    check_window("entry bytes are owinit_main's prologue "
+                 "(sub rsp,0x28; call kconf64_init)",
+                 bytes_are_owinit_main(p), true);
+  }
+}
+
+static void test_user_window_predicates(void) {
+  printf("\n=== User-window address validation ===\n");
+
+  /* --- Address-level: mid-page addresses MUST be accepted. ------------- */
+
+  /* A real owinit entry: OW_USER_IMAGE_BASE + the packed entry RVA 0x40. */
+  check_window("OwMemInUserWindow(0x4000040) /* owinit entry */",
+               OwMemInUserWindow(0x4000040u), true);
+
+  /* A real initial user RSP: stack page top - 8 (the C-ABI return slot). */
+  check_window("OwMemInUserWindow(0x41FEFF8) /* resume rsp */",
+               OwMemInUserWindow(0x41FEFF8u), true);
+
+  /* Last byte of the window is inside; first byte past it is not. */
+  check_window("OwMemInUserWindow(0x41FFFFF) /* last byte */",
+               OwMemInUserWindow(0x41FFFFFu), true);
+  check_window("OwMemInUserWindow(0x4200000) /* one past end */",
+               OwMemInUserWindow(0x4200000u), false);
+  check_window("OwMemInUserWindow(0x3FFFFFF) /* one below start */",
+               OwMemInUserWindow(0x3FFFFFFu), false);
+
+  /* The guard band is inside the window by address but must not be treated as
+   * ordinary user stack/data; the aligned predicate is what gates mapping, and
+   * the address-level one is what gates "may this instruction address run". */
+  check_window("OwMemIsUserWindow(0x41F9000) /* guard base page */",
+               OwMemIsUserWindow(0x41F9000u), true);
+
+  /* --- Page-granular: alignment MUST still be required. ---------------- */
+
+  check_window("OwMemIsUserWindow(0x4000000) /* page base */",
+               OwMemIsUserWindow(0x4000000u), true);
+  check_window("OwMemIsUserWindow(0x4000040) /* mid-page rejected */",
+               OwMemIsUserWindow(0x4000040u), false);
+  check_window("OwMemIsUserWindow(0x41FEFF8) /* mid-page rejected */",
+               OwMemIsUserWindow(0x41FEFF8u), false);
+
+  /* Last mappable page base, and the first page base past the window. */
+  check_window("OwMemIsUserWindow(0x41FF000) /* last page base */",
+               OwMemIsUserWindow(0x41FF000u), true);
+  check_window("OwMemIsUserWindow(0x4200000) /* past window */",
+               OwMemIsUserWindow(0x4200000u), false);
+
+  /* --- The two predicates must not be interchangeable. ------------------ */
+
+  check_window("aligned base is also an in-window address",
+               OwMemInUserWindow(0x4000000u), true);
+  check_window("mid-page address is NOT a valid mapping target",
+               OwMemIsUserWindow(0x4000040u), false);
+}
+
+/* -------------------------------------------------------------------- */
+/* Userspace boot policy: the three owinit states                       */
+/* -------------------------------------------------------------------- */
+/* The classifier is a pure function of the probe, which is the only reason all
+ * three states are testable at all: state 3 panics the machine and state 2 needs
+ * a real volume and a real hand-off, so neither can be reached by simply running
+ * a boot and looking at the log.  Every combination below is a volume that can
+ * exist, so every one of them gets a verdict asserted.
+ *
+ * The cases are written as full field sets rather than as a base plus deltas on
+ * purpose.  The distinction that matters between two of them -- present vs
+ * present-and-valid -- is exactly the distinction a "fill in the interesting
+ * field" style of test would stop expressing the moment someone reorders the
+ * struct. */
+
+static void probe_clear(OW_USERSPACE_PROBE *probe) {
+  memset(probe, 0, sizeof(*probe));
+  probe->PrimaryStatus = OW_ERR_NOT_FOUND;
+  probe->EmergencyStatus = OW_ERR_NOT_FOUND;
+  probe->RescueStatus = OW_ERR_NOT_FOUND;
+}
+
+static void probe_mark_primary(OW_USERSPACE_PROBE *probe, bool present,
+                               bool valid) {
+  probe->PrimaryPresent = present;
+  probe->PrimaryValid = valid;
+  probe->PrimaryStatus = valid ? OW_SUCCESS : OW_ERR_CORRUPT;
+}
+
+static void probe_mark_emergency(OW_USERSPACE_PROBE *probe, bool present,
+                                 bool valid) {
+  probe->EmergencyPresent = present;
+  probe->EmergencyValid = valid;
+  probe->EmergencyStatus = valid ? OW_SUCCESS : OW_ERR_CORRUPT;
+}
+
+static void probe_mark_rescue(OW_USERSPACE_PROBE *probe, bool present,
+                              bool valid) {
+  probe->RescuePresent = present;
+  probe->RescueValid = valid;
+  probe->RescueStatus = valid ? OW_SUCCESS : OW_ERR_CORRUPT;
+}
+
+static void check_state(const char *label, const OW_USERSPACE_PROBE *probe,
+                        OW_USERSPACE_STATE want) {
+  OW_USERSPACE_STATE got = OwBootClassifyUserspace(probe);
+  const char *got_name = OwBootUserspaceStateName(got);
+  const char *want_name = OwBootUserspaceStateName(want);
+
+  if (got == want) {
+    ++g_passed;
+    printf("[PASS] %s = %s\n", label, want_name);
+  } else {
+    ++g_failures;
+    printf("[FAIL] %s: got %s, want %s\n", label, got_name, want_name);
+  }
+}
+
+static void test_userspace_states(void) {
+  OW_USERSPACE_PROBE probe;
+
+  printf("\n=== Userspace boot state classification ===\n");
+
+  /* --- State 1: a usable primary. ------------------------------------- */
+
+  /* The complete volume: all three images present and intact.  This is the
+   * normal test image, and the assertion that matters is the negative one
+   * below -- that the emergency pair being present changes nothing. */
+  probe_clear(&probe);
+  probe_mark_primary(&probe, true, true);
+  probe_mark_emergency(&probe, true, true);
+  probe_mark_rescue(&probe, true, true);
+  check_state("all three images valid", &probe, OW_USERSPACE_PRIMARY);
+
+  /* owinit alone, with no emergency pair at all: still state 1.  A volume
+   * carrying nothing but the orchestrator is the most ordinary volume there
+   * is, and the emergency images must not be a precondition for it. */
+  probe_clear(&probe);
+  probe_mark_primary(&probe, true, true);
+  check_state("owinit valid, no emergency images", &probe,
+              OW_USERSPACE_PRIMARY);
+
+  /* A corrupt owinit.owx does NOT fall to state 1 even though both emergency
+   * images are sitting right there waiting to be used. */
+  probe_clear(&probe);
+  probe_mark_primary(&probe, true, false);
+  probe_mark_emergency(&probe, true, true);
+  probe_mark_rescue(&probe, true, true);
+  check_state("owinit present but corrupt", &probe, OW_USERSPACE_EMERGENCY);
+
+  /* --- State 2: no usable primary, an enterable emergency init. -------- */
+
+  /* The emergency test image: no owinit.owx at all. */
+  probe_clear(&probe);
+  probe_mark_emergency(&probe, true, true);
+  probe_mark_rescue(&probe, true, true);
+  check_state("owinit absent, owinitv+owrs valid", &probe,
+              OW_USERSPACE_EMERGENCY);
+
+  /* owinitv alone.  A rescue shell with no init is a degraded rescue shell, and
+   * the machine is still bootable -- so this must NOT be state 3. */
+  probe_clear(&probe);
+  probe_mark_emergency(&probe, true, true);
+  check_state("owinitv valid, owrs absent", &probe, OW_USERSPACE_EMERGENCY);
+
+  /* owinitv present but corrupt, owrs intact.  This is state 3 and the single
+   * most important case in the set: owrs.owx is a rescue SHELL, and a shell is
+   * not something the kernel can enter as PID 1.  Classifying this as
+   * EMERGENCY because "some emergency bytes are present" would select a state
+   * the hand-off cannot execute, and the machine would fall out of the boot with
+   * no init and no diagnostic. */
+  probe_clear(&probe);
+  probe_mark_emergency(&probe, true, false);
+  probe_mark_rescue(&probe, true, true);
+  check_state("owinitv corrupt, owrs valid (lone shell)", &probe,
+              OW_USERSPACE_ABSENT);
+
+  /* owinitv intact, owrs corrupt.  State 2: the init is enterable, the shell
+   * is not, and owinitv reports the missing shell rather than dying. */
+  probe_clear(&probe);
+  probe_mark_emergency(&probe, true, true);
+  probe_mark_rescue(&probe, true, false);
+  check_state("owinitv valid, owrs corrupt", &probe, OW_USERSPACE_EMERGENCY);
+
+  /* --- State 3: nothing to enter. ------------------------------------- */
+
+  /* The validation image: no userspace at all. */
+  probe_clear(&probe);
+  check_state("no userspace images at all", &probe, OW_USERSPACE_ABSENT);
+
+  /* All three present, none usable.  Corruption everywhere is still state 3. */
+  probe_clear(&probe);
+  probe_mark_primary(&probe, true, false);
+  probe_mark_emergency(&probe, true, false);
+  probe_mark_rescue(&probe, true, false);
+  check_state("all three present but all corrupt", &probe, OW_USERSPACE_ABSENT);
+
+  /* Lone owrs.owx.  The reason this is a case at all is the "and/or" in the
+   * specification: a volume that has emergency bytes but no emergency INIT is
+   * not an emergency userspace, and saying so is the difference between a
+   * panic that says "reinstall owinitv.owx" and one that says "the disk is
+   * empty". */
+  probe_clear(&probe);
+  probe_mark_rescue(&probe, true, true);
+  check_state("lone owrs, no owinitv", &probe, OW_USERSPACE_ABSENT);
+
+  /* The predicates the classifier is built from, asserted separately so a
+   * failure points at the specific promise that broke. */
+  probe_clear(&probe);
+  probe_mark_rescue(&probe, true, true);
+  check_window("OwUserSpaceEmergencyBytes() with a lone owrs", 
+               OwUserSpaceEmergencyBytes(&probe), true);
+  check_window("OwUserSpaceEmergencyAvailable() with a lone owrs",
+               OwUserSpaceEmergencyAvailable(&probe), false);
+
+  probe_clear(&probe);
+  check_window("OwUserSpaceEmergencyBytes() on an empty volume",
+               OwUserSpaceEmergencyBytes(&probe), false);
+  check_window("OwUserSpaceEmergencyAvailable() on an empty volume",
+               OwUserSpaceEmergencyAvailable(&probe), false);
+
+  probe_mark_emergency(&probe, true, true);
+  check_window("OwUserSpaceEmergencyAvailable() with a valid owinitv",
+               OwUserSpaceEmergencyAvailable(&probe), true);
+
+  /* A null probe is state 3, not a crash.  The classifier is called from boot
+   * code where a NULL would be a bug worth surviving. */
+  check_state("NULL probe", (const OW_USERSPACE_PROBE *)0, OW_USERSPACE_ABSENT);
+}
+
+/* -------------------------------------------------------------------- */
+/* Emergency image integrity                                              */
+/* -------------------------------------------------------------------- */
+/* Two things are checked here, and the second is the one that matters.
+ *
+ * First: the emergency pair really is present in the build and passes the
+ * verdict the boot survey acts on.  A missing owinitv.owx would make the state-2
+ * test image silently unbootable, and it would do so at the moment someone
+ * wanted to reproduce a failure.
+ *
+ * Second: corrupting a byte makes them fail it.  This is the assertion the whole
+ * "invalid" half of the policy rests on.  Without it, "invalid" is only ever
+ * demonstrated by a header with a wrong magic number, and a bit-rot in a code
+ * section -- which passes every structural check the loader makes -- would still
+ * be classified PRIMARY and then fault at CPL3. */
+static void test_emergency_images(void) {
+  static unsigned char scratch[OW_USERSPACE_IMAGE_MAX];
+  size_t i;
+
+  printf("\n=== Emergency image integrity ===\n");
+
+  check_window("owinitv.owx is present in the build",
+               OWINITV_IMAGE_SIZE > 0u, true);
+  check_window("owrs.owx is present in the build", OWRS_IMAGE_SIZE > 0u, true);
+
+  check_window("owinitv.owx passes OwOwxImageIsUsable",
+               OwOwxImageIsUsable(g_owinitv_image, OWINITV_IMAGE_SIZE), true);
+  check_window("owrs.owx passes OwOwxImageIsUsable",
+               OwOwxImageIsUsable(g_owrs_image, OWRS_IMAGE_SIZE), true);
+
+  check_window("owinit.owx passes OwOwxImageIsUsable",
+               OwOwxImageIsUsable(g_owinit_image, OWINIT_IMAGE_SIZE), true);
+
+  /* Both emergency images must be loadable AND self-contained.  An import
+   * descriptor means the loader refuses the image outright, so the emergency
+   * path would exist on paper only. */
+  {
+    const owx_header_t *hv = (const owx_header_t *)(const void *)g_owinitv_image;
+    const owx_header_t *hr = (const owx_header_t *)(const void *)g_owrs_image;
+    check_window("owinitv.owx declares no imports", hv->import_count == 0u, true);
+    check_window("owrs.owx declares no imports", hr->import_count == 0u, true);
+    check_window("owinitv.owx subsystem is RECOVERY",
+                 hv->subsystem == OWX_SUBSYSTEM_RECOVERY, true);
+    check_window("owrs.owx subsystem is RECOVERY",
+                 hr->subsystem == OWX_SUBSYSTEM_RECOVERY, true);
+  }
+
+  /* Corruption, one byte at a time through the OWX image.
+   *
+   * The positions are all inside the OWX image rather than the file, because the
+   * two are no longer the same length: a signed image is image||CICB, so
+   * OWRS_IMAGE_SIZE covers the block as well and a spot chosen by absolute file
+   * offset can land in the trailer on one build and in a section on another.
+   * The bound used here is the header's image_size, which is the same quantity
+   * the structural checks range over.
+   *
+   * The interesting positions are the ones a real failure produces: inside the
+   * header (a truncated or re-flashed image), inside the section table (a bad
+   * table entry that the structural checks cannot see), and deep in a code
+   * section (bit rot, which is the case a header-only test would miss
+   * entirely). */
+  {
+    const owx_header_t *h = (const owx_header_t *)(const void *)g_owrs_image;
+    const uint32_t image_size = h->image_size;
+    const size_t spots[] = {
+        0x0000u,  /* magic */
+        0x0040u,  /* section_count */
+        0x0100u,  /* first section table entry */
+        0x0100u + 24u, /* a section's checksum field */
+        0x1000u + 8u,  /* into the code section */
+        0x2000u         /* past the first section */
+    };
+    const char *labels[] = {
+        "magic", "section_count", "section table entry", "section checksum",
+        "code section", "second section"
+    };
+    size_t s;
+
+    check_window("the owrs OWX image is inside its own file",
+                 image_size <= OWRS_IMAGE_SIZE, true);
+
+    for (s = 0; s < sizeof(spots) / sizeof(spots[0]); s++) {
+      if (spots[s] >= image_size) continue;
+      memcpy(scratch, g_owrs_image, OWRS_IMAGE_SIZE);
+      scratch[spots[s]] ^= 0xFFu;
+      if (OwOwxImageIsUsable(scratch, OWRS_IMAGE_SIZE)) {
+        ++g_failures;
+        printf("[FAIL] owrs.owx with a flipped byte at 0x%04X (%s) is still "
+               "reported usable\n", (unsigned)spots[s], labels[s]);
+      } else {
+        ++g_passed;
+        printf("[PASS] owrs.owx with a flipped byte at 0x%04X (%s) is "
+               "unusable\n", (unsigned)spots[s], labels[s]);
+      }
+    }
+
+    /* A flipped byte in the trailer is a different thing, and it is CIS's job
+     * rather than the structural checks'.  Structural validation ranges over
+     * [0, image_size) and is supposed to ignore the block entirely, so this is
+     * recorded as "still structurally usable" -- the signature is what has to
+     * catch it, and the CIS fixture corpus is where that is tested. */
+    if (OWRS_IMAGE_SIZE > image_size) {
+      memcpy(scratch, g_owrs_image, OWRS_IMAGE_SIZE);
+      scratch[OWRS_IMAGE_SIZE - 1u] ^= 0xFFu;
+      check_window("a flipped trailer byte is outside OWX structural validation",
+                   OwOwxImageIsUsable(scratch, OWRS_IMAGE_SIZE), true);
+    }
+  }
+
+  /* Truncation: the loader's own bound is image_size <= bytes held, so a short
+   * read has to fail before anything is mapped.
+   *
+   * Measured against image_size, not the file length.  Chopping a byte off the
+   * end of a signed image removes a trailer byte, which leaves the OWX image
+   * complete and the image genuinely loadable-as-a-OWX; refusing it would be the
+   * structural check second-guessing CIS.  Chopping into the image proper is the
+   * failure this is actually about. */
+  {
+    const owx_header_t *h = (const owx_header_t *)(const void *)g_owrs_image;
+    const uint32_t image_size = h->image_size;
+
+    for (i = 0; i < 3; i++) {
+      uint32_t short_by = (uint32_t)(1u << (8u * i));
+      if (short_by >= image_size) continue;
+      check_window("owrs.owx truncated inside the OWX image is unusable",
+                   OwOwxImageIsUsable(g_owrs_image, image_size - short_by),
+                   false);
+    }
+  }
+
+  /* The two in-kernel CRC32c implementations must agree.
+   *
+   * ps/owx_loader.c carries its own CRC32c so the OWX format's integrity check
+   * lives with the format rather than depending on the VFS.  That leaves two
+   * copies of the same polynomial in the tree (this one and
+   * OwFsChecksumCalc() in vfs/vfs.c) plus a third in tools/owx_pack.py.  A copy
+   * that drifts does not produce a load failure -- it produces an image rejected
+   * for no visible reason, or worse, one accepted that should not be.
+   *
+   * Note what this deliberately does NOT do: reimplement the polynomial a third
+   * time to compare against.  A test that carries its own copy of the algorithm
+   * it is validating cannot tell "the two implementations agree" from "the test
+   * agrees with itself", which is the failure a checksum test is most prone to.
+   * It compares the two real functions over a byte-for-byte identical range.
+   *
+   * The range is [0x10, end) with the image_checksum field read as zero, because
+   * that field lies inside its own hash window: the packer hashed it as zero and
+   * then wrote the result in, so verifying it requires putting it back. */
+  {
+/* Over the OWX image, which is the header's image_size rather than the file
+   * length: the packer computes image_checksum before appending the CIS block,
+   * so a signed image's file length would make this compare the packer's value
+   * against a range it never hashed. */
+  const owx_header_t *h = (const owx_header_t *)(const void *)g_owrs_image;
+  const uint32_t n = h->image_size;
+  const uint32_t declared = h->image_checksum;
+  uint32_t vfs_crc;
+
+  check_window("the CRC range does not run past the owrs file",
+               n <= OWRS_IMAGE_SIZE, true);
+
+  memcpy(scratch, g_owrs_image, n);
+    scratch[0x90] = 0;
+    scratch[0x91] = 0;
+    scratch[0x92] = 0;
+    scratch[0x93] = 0;
+    vfs_crc = OwFsChecksumCalc(scratch + 0x10, n - 0x10);
+
+    /* Proves the two kernels agree on the same bytes, and that the packer wrote
+     * the same value they compute.  All three at once, because any two of them
+     * agreeing while the third differs is exactly the drift being guarded. */
+    check_window("VFS and OWX CRC32c agree over the image_checksum range",
+                 vfs_crc == declared, true);
+  }
+}
+
+static void expect(const char *needle, size_t minimum_count) {
+  char *output;
+  size_t count;
+
+  output = HostHalOutput();
+
+  if (output == NULL)
+    return;
+
+  count = count_occ(output, needle);
+
+  if (count >= minimum_count) {
+    ++g_passed;
+
+    printf("[PASS] <<%s>> x%u\n", needle, (unsigned)count);
+  } else {
+    ++g_failures;
+
+    printf("[FAIL] <<%s>> expected >=%u, found %u\n", needle,
+           (unsigned)minimum_count, (unsigned)count);
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Host file access                                                           */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Read a host file into a caller-provided buffer.
+ *
+ * Returns:
+ *   >= 0 : number of bytes read
+ *   -1   : failure
+ *
+ * No stdio file API is used.
+ */
+static long host_read_file(const char *path, uint8_t *buffer, size_t capacity) {
+  int fd;
+  long total = 0;
+
+  if (path == NULL || buffer == NULL || capacity == 0) {
+    return -1;
+  }
+
+#ifdef _WIN32
+
+  {
+    errno_t result;
+
+    result = _sopen_s(&fd, path, _O_RDONLY | _O_BINARY, _SH_DENYNO, 0);
+
+    if (result != 0 || fd < 0)
+      return -1;
+  }
+
+#else
+
+  fd = open(path, O_RDONLY);
+
+  if (fd < 0)
+    return -1;
+
+#endif
+
+  while ((size_t)total < capacity) {
+    size_t remaining;
+    unsigned int request;
+    int bytes_read;
+
+    remaining = capacity - (size_t)total;
+
+    /*
+     * Keep the read size inside the range accepted by both
+     * the Windows CRT and normal POSIX implementations.
+     */
+    request = (remaining > 0x7FFFFFFFU) ? 0x7FFFFFFFU : (unsigned int)remaining;
+
+#ifdef _WIN32
+
+    bytes_read = _read(fd, buffer + total, request);
+
+#else
+
+    bytes_read = (int)read(fd, buffer + total, request);
+
+#endif
+
+    if (bytes_read < 0) {
+
+#ifdef _WIN32
+      _close(fd);
+#else
+      close(fd);
+#endif
+
+      return -1;
+    }
+
+    if (bytes_read == 0)
+      break;
+
+    total += (long)bytes_read;
+  }
+
+#ifdef _WIN32
+  _close(fd);
+#else
+  close(fd);
+#endif
+
+  return total;
+}
+
+/*
+ * Try:
+ *
+ *   name
+ *   build/name
+ *   ../name
+ *
+ * without constructing paths using snprintf/strcpy.
+ */
+static long host_read_file_candidates(const char *name, uint8_t *buffer,
+                                      size_t capacity) {
+  static const char *const prefixes[] = {"", "build/", "../"};
+
+  size_t prefix_index;
+
+  if (name == NULL)
+    return -1;
+
+  for (prefix_index = 0; prefix_index < sizeof(prefixes) / sizeof(prefixes[0]);
+       ++prefix_index) {
+
+    char path[512];
+    size_t prefix_length;
+    size_t name_length;
+
+    prefix_length = ow_strlen(prefixes[prefix_index]);
+    name_length = ow_strlen(name);
+
+    if (prefix_length + name_length + 1 > sizeof(path))
+      continue;
+
+    if (prefix_length != 0) {
+      ow_copy_bytes((uint8_t *)path, (const uint8_t *)prefixes[prefix_index],
+                    prefix_length);
+    }
+
+    ow_copy_bytes((uint8_t *)path + prefix_length, (const uint8_t *)name,
+                  name_length);
+
+    path[prefix_length + name_length] = '\0';
+
+    {
+      long result;
+
+      result = host_read_file(path, buffer, capacity);
+
+      if (result >= 0)
+        return result;
+    }
+  }
+
+  return -1;
+}
+
+/* -------------------------------------------------------------------- */
+/* Copyleft Integrity Safeguard: enforcement state (Stage 1)             */
+/* -------------------------------------------------------------------- */
+/*
+ * Stage 1 owns no verdict logic, so these cases are about the two properties
+ * every later stage leans on rather than about any particular verification:
+ *
+ *   - An unprovisioned trust store refuses everything.  This build pins zero
+ *     keys, so "no keys" must not degrade into "no checking": a subsystem that
+ *     waves images through because it has nothing to compare them against is
+ *     the exact failure mode CIS exists to prevent.
+ *
+ *   - The measurement log is append-only and does not recycle.  Once the table
+ *     is full the subsystem reports what it already knows instead of
+ *     overwriting the oldest decision, because the log is the only record a
+ *     quarantined system has of what it refused and why.
+ *
+ * The trust-store injection used below is host-only (OW_HOST_HAL).  It proves
+ * the lookup paths agree with the table layout; it is not a way to make a
+ * production kernel accept an unprovisioned key, and no production build
+ * compiles the call.
+ */
+static void check_eq(const char *label, unsigned long got,
+                     unsigned long want) {
+  if (got == want) {
+    ++g_passed;
+    printf("[PASS] %s = %lu\n", label, got);
+  } else {
+    ++g_failures;
+    printf("[FAIL] %s: got %lu, want %lu\n", label, got, want);
+  }
+}
+
+/* -------------------------------------------------------------------- */
+/* CIS block format tests                                                */
+/* -------------------------------------------------------------------- */
+/* check_bytes and check_bytes_v are defined further down, beside the crypto
+ * tests that first needed them.  Declared here so this test can use the same
+ * comparators rather than a second, near-identical pair. */
+static void check_bytes(const char *label, const uint8_t *got,
+                        const uint8_t *want, size_t len);
+static void check_bytes_v(const char *what, uint32_t index, const uint8_t *got,
+                          const uint8_t *want, size_t len);
+/*
+ * Blocks are built here rather than read from a generated corpus, because the
+ * cases worth testing are not "the right bytes" but one field changed from the
+ * right bytes: a magic off by a bit, a manifest_size that disagrees with
+ * block_size, a tag repeated, a tag moved below its predecessor, an overlong
+ * UTF-8 sequence.  A corpus of valid blocks exercises none of those.
+ *
+ * Each case breaks exactly one thing, so a failure names the rule it broke, and
+ * each expects a specific status rather than merely "not OK" -- otherwise a
+ * block rejected for the wrong reason still reads as a pass.
+ */
+
+#define CIS_TEST_MAX 512u
+
+typedef struct {
+  uint8_t bytes[CIS_TEST_MAX];
+  uint32_t size;
+} cis_test_block;
+
+/* The append helpers bounds-check against CIS_TEST_MAX rather than trusting the
+ * caller: a builder that can overrun its buffer turns a parser bug into a
+ * harness crash, which reports the wrong defect. */
+static bool cis_test_put(cis_test_block *b, uint8_t v) {
+  if (b->size >= CIS_TEST_MAX) {
+    return false;
+  }
+  b->bytes[b->size++] = v;
+  return true;
+}
+
+static bool cis_test_put_u16(cis_test_block *b, uint16_t v) {
+  return cis_test_put(b, (uint8_t)(v & 0xFFu)) &&
+         cis_test_put(b, (uint8_t)((v >> 8) & 0xFFu));
+}
+
+static bool cis_test_put_u32(cis_test_block *b, uint32_t v) {
+  return cis_test_put(b, (uint8_t)(v & 0xFFu)) &&
+         cis_test_put(b, (uint8_t)((v >> 8) & 0xFFu)) &&
+         cis_test_put(b, (uint8_t)((v >> 16) & 0xFFu)) &&
+         cis_test_put(b, (uint8_t)((v >> 24) & 0xFFu));
+}
+
+static bool cis_test_put_bytes(cis_test_block *b, const uint8_t *p, size_t n) {
+  size_t i;
+  for (i = 0; i < n; i++) {
+    if (!cis_test_put(b, p[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool cis_test_put_tlv(cis_test_block *b, uint16_t tag,
+                             const uint8_t *value, uint16_t len) {
+  return cis_test_put_u16(b, tag) && cis_test_put_u16(b, len) &&
+         cis_test_put_bytes(b, value, (size_t)len);
+}
+
+static void cis_test_put_tlv_text(cis_test_block *b, uint16_t tag,
+                                  const char *s) {
+  (void)cis_test_put_tlv(b, tag, (const uint8_t *)s, (uint16_t)strlen(s));
+}
+
+/* The reference manifest's text values, named once so the assertions below
+ * compare against strlen rather than a literal that can drift from the string. */
+#define CIS_TEST_LICENSE   "MIT"
+#define CIS_TEST_COPYRIGHT "(c) OpenWindows"
+
+/* The key id and content digest the reference manifest carries, so the parse
+ * can be compared against them by name instead of by a byte offset computed
+ * from the layout. */
+static void cis_test_expected_ids(uint8_t *key_id, uint8_t *digest) {
+  size_t i;
+  for (i = 0; i < OW_CIS_KEY_ID_SIZE; i++) {
+    key_id[i] = (uint8_t)(0x10u + i);
+  }
+  for (i = 0; i < OW_SHA256_DIGEST_SIZE; i++) {
+    digest[i] = (uint8_t)(0x20u + i);
+  }
+}
+
+/* A well-formed manifest: the 32-byte prefix, then the five required tags in
+ * ascending order.  build-id (6) is left out so the optional path is exercised
+ * by the good case as well as the bad ones.  The signature is all zeros: the
+ * builder knows no key, and the parser must not care. */
+static bool cis_test_build_manifest(cis_test_block *m) {
+  uint8_t key_id[OW_CIS_KEY_ID_SIZE];
+  uint8_t digest[OW_SHA256_DIGEST_SIZE];
+  uint8_t algo[4];
+  size_t i;
+  const size_t prefix_len = sizeof(OW_CIS_MANIFEST_PREFIX) - 1u;
+
+  memset(m, 0, sizeof(*m));
+  if (!cis_test_put_bytes(m, (const uint8_t *)OW_CIS_MANIFEST_PREFIX,
+                          prefix_len)) {
+    return false;
+  }
+  for (i = prefix_len; i < OW_CIS_MANIFEST_PREFIX_SIZE; i++) {
+    if (!cis_test_put(m, 0U)) {
+      return false;
+    }
+  }
+
+  cis_test_expected_ids(key_id, digest);
+  algo[0] = (uint8_t)(OW_CIS_DIGEST_ALGO_SHA256 & 0xFFu);
+  algo[1] = (uint8_t)((OW_CIS_DIGEST_ALGO_SHA256 >> 8) & 0xFFu);
+  algo[2] = 0U;
+  algo[3] = 0U;
+
+  cis_test_put_tlv_text(m, OW_CIS_TAG_LICENSE, CIS_TEST_LICENSE);
+  if (!cis_test_put_tlv(m, OW_CIS_TAG_DIGEST_ALGO, algo, 4u) ||
+      !cis_test_put_tlv(m, OW_CIS_TAG_KEY_ID, key_id,
+                        (uint16_t)sizeof(key_id)) ||
+      !cis_test_put_tlv(m, OW_CIS_TAG_CONTENT_DIGEST, digest,
+                        (uint16_t)sizeof(digest))) {
+    return false;
+  }
+  cis_test_put_tlv_text(m, OW_CIS_TAG_COPYRIGHT, CIS_TEST_COPYRIGHT);
+  return true;
+}
+
+/* Wrap a manifest in a well-formed block: 48-byte header, manifest, 64 zero
+ * bytes of signature. */
+static bool cis_test_build_block(cis_test_block *b,
+                                 const cis_test_block *m) {
+  const uint32_t block_size = OW_CIS_BLOCK_HEADER_SIZE + m->size +
+                              OW_CIS_SIGNATURE_SIZE;
+  size_t i;
+
+  memset(b, 0, sizeof(*b));
+  if (m->size > OW_CIS_MAX_MANIFEST_SIZE || block_size > CIS_TEST_MAX) {
+    return false;
+  }
+  if (!cis_test_put_u32(b, OW_CIS_BLOCK_MAGIC) ||
+      !cis_test_put_u16(b, OW_CIS_BLOCK_VERSION) ||
+      !cis_test_put_u16(b, (uint16_t)OW_CIS_BLOCK_HEADER_SIZE) ||
+      !cis_test_put_u32(b, block_size) || !cis_test_put_u32(b, m->size)) {
+    return false;
+  }
+  /* reserved0, flags, reserved1 and reserved2 are all zero, which the loop
+   * below writes out to the end of the header. */
+  for (i = b->size; i < OW_CIS_BLOCK_HEADER_SIZE; i++) {
+    if (!cis_test_put(b, 0U)) {
+      return false;
+    }
+  }
+  if (!cis_test_put_bytes(b, m->bytes, m->size)) {
+    return false;
+  }
+  for (i = 0U; i < OW_CIS_SIGNATURE_SIZE; i++) {
+    if (!cis_test_put(b, 0U)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/* Locate a tag's value inside a built manifest.  Used instead of hardcoded
+ * offsets, so the mutation cases keep saying what they mean when the reference
+ * manifest changes.  Returns 0xFFFFFFFF when the tag is absent. */
+static uint32_t cis_test_find_tlv(const cis_test_block *m, uint16_t want_tag) {
+  uint32_t at = OW_CIS_MANIFEST_PREFIX_SIZE;
+
+  while (at + 4u <= m->size) {
+    uint16_t tag = (uint16_t)((uint16_t)m->bytes[at] |
+                              ((uint16_t)m->bytes[at + 1u] << 8));
+    uint16_t len = (uint16_t)((uint16_t)m->bytes[at + 2u] |
+                              ((uint16_t)m->bytes[at + 3u] << 8));
+    if (tag == want_tag) {
+      return at + 4u;
+    }
+    if ((uint64_t)at + 4u + len > m->size) {
+      break;
+    }
+    at += 4u + (uint32_t)len;
+  }
+  return 0xFFFFFFFFu;
+}
+
+/* The declared length of a tag's value, or 0xFFFFFFFF when the tag is absent.
+ * The tag-removal cases read this rather than hardcoding a length: a hardcoded
+ * length that is one byte too long silently underflows the memmove size, and
+ * the symptom is a crash in a test helper rather than a failed assertion. */
+static uint32_t cis_test_tlv_len(const cis_test_block *m, uint16_t tag) {
+  const uint32_t at = cis_test_find_tlv(m, tag);
+  const uint32_t hdr = at - 4u;
+  return (uint16_t)((uint16_t)m->bytes[hdr + 2u] |
+                    ((uint16_t)m->bytes[hdr + 3u] << 8));
+}
+
+/* Delete one TLV, closing the gap.  Returns false if the tag is absent or the
+ * arithmetic does not close. */
+static bool cis_test_remove_tlv(cis_test_block *m, uint16_t tag) {
+  const uint32_t value_at = cis_test_find_tlv(m, tag);
+  uint32_t tlv_at;
+  uint32_t tlv_len;
+
+  if (value_at == 0xFFFFFFFFu || value_at < 4u) {
+    return false;
+  }
+  tlv_at = value_at - 4u;
+  tlv_len = 4u + cis_test_tlv_len(m, tag);
+  if (tlv_len > m->size || tlv_at > m->size - tlv_len) {
+    return false;
+  }
+  memmove(&m->bytes[tlv_at], &m->bytes[tlv_at + tlv_len],
+          m->size - tlv_at - tlv_len);
+  m->size -= tlv_len;
+  return true;
+}
+
+static void cis_check_parse(const char *label, const cis_test_block *b,
+                            uint32_t available, OW_CIS_FORMAT_STATUS want) {
+  OW_CIS_BLOCK parsed;
+  const OW_CIS_FORMAT_STATUS got =
+      OwCisFormatParse(b->bytes, available, &parsed);
+
+  if (got == want) {
+    ++g_passed;
+    if (want == OW_CIS_FORMAT_OK) {
+      printf("[PASS] %s = %s\n", label, OwCisFormatStatusName(got));
+    } else {
+      printf("[PASS] %s rejected as %s\n", label, OwCisFormatStatusName(got));
+    }
+    return;
+  }
+  ++g_failures;
+  printf("[FAIL] %s: got %s, want %s\n", label, OwCisFormatStatusName(got),
+         OwCisFormatStatusName(want));
+}
+
+/* Copy a base manifest, append one TLV to it, wrap it in a block, and require a
+ * status.  The common shape of most of the TLV cases.  Taking the base as an
+ * argument rather than rebuilding the reference is what lets a case start from a
+ * manifest that has already been altered. */
+static void cis_check_extra_tlv(const char *label, const cis_test_block *base,
+                                uint16_t tag, const uint8_t *value,
+                                uint16_t len, OW_CIS_FORMAT_STATUS want) {
+  cis_test_block m;
+  cis_test_block blk;
+
+  if (!base) {
+    ++g_failures;
+    printf("[FAIL] %s: no base manifest\n", label);
+    return;
+  }
+  m = *base;
+  if (!cis_test_put_tlv(&m, tag, value, len)) {
+    ++g_failures;
+    printf("[FAIL] %s: the extra tag did not fit the test manifest\n", label);
+    return;
+  }
+  if (!cis_test_build_block(&blk, &m)) {
+    ++g_failures;
+    printf("[FAIL] %s: manifest did not fit the test block\n", label);
+    return;
+  }
+  cis_check_parse(label, &blk, blk.size, want);
+}
+
+/* Wrap a manifest in a well-formed block and require a status.  Used for every
+ * case that alters the manifest rather than the header: the header is what
+ * locates the block, so feeding a bare manifest to the parser would test the
+ * magic instead of the rule under examination. */
+static void cis_check_manifest_parse(const char *label,
+                                     const cis_test_block *m,
+                                     OW_CIS_FORMAT_STATUS want) {
+  cis_test_block blk;
+
+  if (!cis_test_build_block(&blk, m)) {
+    ++g_failures;
+    printf("[FAIL] %s: the manifest did not fit the test block\n", label);
+    return;
+  }
+  cis_check_parse(label, &blk, blk.size, want);
+}
+
+static void test_cis_format(void) {
+  cis_test_block manifest;
+  cis_test_block good;
+  cis_test_block b;
+
+  printf("\n=== CIS block format ===\n");
+
+  if (!cis_test_build_manifest(&manifest) ||
+      !cis_test_build_block(&good, &manifest)) {
+    ++g_failures;
+    printf("[FAIL] could not build the reference block\n");
+    return;
+  }
+  check_eq("reference block size", good.size,
+           OW_CIS_BLOCK_HEADER_SIZE + manifest.size + OW_CIS_SIGNATURE_SIZE);
+
+  /* ---- the reference block parses ------------------------------------- */
+  cis_check_parse("the reference block", &good, good.size, OW_CIS_FORMAT_OK);
+  {
+    OW_CIS_BLOCK parsed;
+    uint8_t key_id[OW_CIS_KEY_ID_SIZE];
+    uint8_t digest[OW_SHA256_DIGEST_SIZE];
+
+    if (OwCisFormatParse(good.bytes, good.size, &parsed) !=
+        OW_CIS_FORMAT_OK) {
+      printf("       (field checks skipped, parse failed)\n");
+      return;
+    }
+    check_eq("parsed block size agrees with the bytes", parsed.BlockSize,
+             good.size);
+    check_eq("parsed manifest size", parsed.ManifestSize, manifest.size);
+    check_eq("the signed range excludes exactly the signature",
+             parsed.SignedSize,
+             OW_CIS_BLOCK_HEADER_SIZE + manifest.size);
+    check_window("the signed range starts at the block",
+                 parsed.Signed == good.bytes, true);
+    check_window("the signature sits at the end of the block",
+                 parsed.Signature ==
+                     good.bytes + good.size - OW_CIS_SIGNATURE_SIZE,
+                 true);
+    check_eq("digest algorithm round-trips", parsed.DigestAlgorithm,
+             OW_CIS_DIGEST_ALGO_SHA256);
+    cis_test_expected_ids(key_id, digest);
+    check_bytes("key id round-trips", parsed.KeyId, key_id,
+                OW_CIS_KEY_ID_SIZE);
+    check_bytes("content digest round-trips", parsed.ContentDigest, digest,
+                OW_SHA256_DIGEST_SIZE);
+    check_window("licence round-trips",
+                 parsed.LicenseSize == strlen(CIS_TEST_LICENSE) &&
+                     memcmp(parsed.License, CIS_TEST_LICENSE, strlen(CIS_TEST_LICENSE)) == 0,
+                 true);
+    check_window("copyright round-trips",
+                 parsed.CopyrightSize == strlen(CIS_TEST_COPYRIGHT) &&
+                     memcmp(parsed.Copyright, CIS_TEST_COPYRIGHT,
+                            strlen(CIS_TEST_COPYRIGHT)) == 0,
+                 true);
+    check_window("an absent optional tag stays absent", parsed.BuildId == NULL,
+                 true);
+    check_eq("five tags were seen", parsed.TagCount, 5);
+  }
+
+  check_window("every parse status has a printable name",
+               strcmp(OwCisFormatStatusName(OW_CIS_FORMAT_OK), "ok") == 0 &&
+                   strcmp(OwCisFormatStatusName(OW_CIS_FORMAT_DUPLICATE_TAG),
+                          "duplicate tag") == 0,
+               true);
+
+  /* ---- trailing bytes past the block are ignored ----------------------- */
+  /* The loader already ignores them, so a format that refused them would reject
+   * files it can otherwise read for no security gain. */
+  {
+    cis_test_block padded = good;
+    uint32_t i;
+    for (i = 0U; i < 7U; i++) {
+      (void)cis_test_put(&padded, (uint8_t)(0xDEu + i));
+    }
+    cis_check_parse("trailing bytes past the block", &padded, padded.size,
+                    OW_CIS_FORMAT_OK);
+  }
+
+  /* ---- argument handling ----------------------------------------------- */
+  {
+    OW_CIS_BLOCK parsed;
+    check_eq("a null block is refused",
+             (unsigned long)OwCisFormatParse(NULL, 128u, &parsed),
+             (unsigned long)OW_CIS_FORMAT_NULL_ARGUMENT);
+    check_eq("a null output is refused",
+             (unsigned long)OwCisFormatParse(good.bytes, good.size, NULL),
+             (unsigned long)OW_CIS_FORMAT_NULL_ARGUMENT);
+  }
+
+  /* ---- header fields, one broken at a time ----------------------------- */
+  {
+    /* Magic. */
+    b = good;
+    b.bytes[0] ^= 0x01u;
+    cis_check_parse("magic changed", &b, b.size, OW_CIS_FORMAT_BAD_MAGIC);
+    b = good;
+    b.bytes[1] = 0x00u;
+    cis_check_parse("magic truncated to three bytes", &b, b.size,
+                    OW_CIS_FORMAT_BAD_MAGIC);
+    b = good;
+    b.bytes[3] = 0x00u;
+    cis_check_parse("magic's last byte cleared", &b, b.size,
+                    OW_CIS_FORMAT_BAD_MAGIC);
+
+    /* Version: a future version is refused, not guessed at. */
+    b = good;
+    b.bytes[0x04] = 2U;
+    cis_check_parse("a future version", &b, b.size,
+                    OW_CIS_FORMAT_UNSUPPORTED_VERSION);
+    b = good;
+    b.bytes[0x04] = 0U;
+    cis_check_parse("version zero", &b, b.size,
+                    OW_CIS_FORMAT_UNSUPPORTED_VERSION);
+
+    /* A header_size other than 48 describes a different header, so every
+     * offset this parser used would stop meaning what it means. */
+    b = good;
+    b.bytes[0x06] = 64U;
+    cis_check_parse("header_size other than 48", &b, b.size,
+                    OW_CIS_FORMAT_BAD_HEADER_SIZE);
+    b = good;
+    b.bytes[0x06] = 0U;
+    cis_check_parse("header_size zero", &b, b.size,
+                    OW_CIS_FORMAT_BAD_HEADER_SIZE);
+
+    /* Reserved fields and flags.  A flag bit this build has never had to
+     * interpret is not a reason to ignore it silently. */
+    b = good;
+    b.bytes[0x10] = 1U;
+    cis_check_parse("reserved0 non-zero", &b, b.size,
+                    OW_CIS_FORMAT_RESERVED_NOT_ZERO);
+    b = good;
+    b.bytes[0x14] = 1U;
+    cis_check_parse("an undefined flag bit", &b, b.size,
+                    OW_CIS_FORMAT_RESERVED_NOT_ZERO);
+    b = good;
+    b.bytes[0x18] = 1U;
+    cis_check_parse("reserved1 non-zero", &b, b.size,
+                    OW_CIS_FORMAT_RESERVED_NOT_ZERO);
+    b = good;
+    b.bytes[0x27] = 1U;
+    cis_check_parse("the last byte of reserved1 non-zero", &b, b.size,
+                    OW_CIS_FORMAT_RESERVED_NOT_ZERO);
+    b = good;
+    b.bytes[0x28] = 1U;
+    cis_check_parse("reserved2 non-zero", &b, b.size,
+                    OW_CIS_FORMAT_RESERVED_NOT_ZERO);
+    b = good;
+    b.bytes[0x2F] = 1U;
+    cis_check_parse("the last byte of reserved2 non-zero", &b, b.size,
+                    OW_CIS_FORMAT_RESERVED_NOT_ZERO);
+  }
+
+  /* ---- size fields ------------------------------------------------------ */
+  {
+    b = good;
+    b.bytes[0x08] = (uint8_t)(b.bytes[0x08] - 1u);
+    cis_check_parse("block_size one short", &b, b.size,
+                    OW_CIS_FORMAT_BAD_BLOCK_SIZE);
+    b = good;
+    b.bytes[0x08] = (uint8_t)(b.bytes[0x08] + 1u);
+    cis_check_parse("block_size one over", &b, b.size,
+                    OW_CIS_FORMAT_BAD_BLOCK_SIZE);
+    b = good;
+    b.bytes[0x0C] = (uint8_t)(b.bytes[0x0C] + 1u);
+    cis_check_parse("manifest_size one over", &b, b.size,
+                    OW_CIS_FORMAT_BAD_BLOCK_SIZE);
+    b = good;
+    memset(&b.bytes[0x08], 0, 4u);
+    cis_check_parse("block_size zero", &b, b.size,
+                    OW_CIS_FORMAT_BAD_BLOCK_SIZE);
+    b = good;
+    memset(&b.bytes[0x08], 0xFF, 4u);
+    memset(&b.bytes[0x0C], 0xFF, 4u);
+    cis_check_parse("block_size and manifest_size both 0xFFFFFFFF", &b, b.size,
+                    OW_CIS_FORMAT_BAD_BLOCK_SIZE);
+    /* A block that claims more than the caller holds.  This is the case a
+     * loader hands over when a file is truncated after the image. */
+    cis_check_parse("block_size larger than the bytes held", &good,
+                    good.size - 1u, OW_CIS_FORMAT_BAD_BLOCK_SIZE);
+    cis_check_parse("fewer than 48 bytes available", &good, 8u,
+                    OW_CIS_FORMAT_BAD_MAGIC);
+    cis_check_parse("exactly 48 bytes available, none of it a block", &good,
+                    48u, OW_CIS_FORMAT_BAD_BLOCK_SIZE);
+
+    /* manifest_size past the sanity bound, with block_size kept consistent so
+     * the size bound itself is what refuses it.  The parser answers
+     * MANIFEST_TOO_LARGE rather than BAD_BLOCK_SIZE because both sizes agree
+     * with each other: what is wrong is the magnitude. */
+    b = good;
+    {
+      const uint32_t big = OW_CIS_MAX_MANIFEST_SIZE + 1u;
+      const uint32_t total =
+          OW_CIS_BLOCK_HEADER_SIZE + big + OW_CIS_SIGNATURE_SIZE;
+      b.bytes[0x08] = (uint8_t)(total & 0xFFu);
+      b.bytes[0x09] = (uint8_t)((total >> 8) & 0xFFu);
+      b.bytes[0x0A] = (uint8_t)((total >> 16) & 0xFFu);
+      b.bytes[0x0B] = (uint8_t)((total >> 24) & 0xFFu);
+      b.bytes[0x0C] = (uint8_t)(big & 0xFFu);
+      b.bytes[0x0D] = (uint8_t)((big >> 8) & 0xFFu);
+      b.bytes[0x0E] = (uint8_t)((big >> 16) & 0xFFu);
+      b.bytes[0x0F] = (uint8_t)((big >> 24) & 0xFFu);
+    }
+    cis_check_parse("manifest_size over the sanity bound", &b, b.size,
+                    OW_CIS_FORMAT_MANIFEST_TOO_LARGE);
+
+    /* A block whose manifest is exactly at the bound: the bound is a limit, not
+     * an off-by-one that rejects the last legal size. */
+    b = good;
+    {
+      const uint32_t exact = OW_CIS_MAX_MANIFEST_SIZE;
+      const uint32_t total =
+          OW_CIS_BLOCK_HEADER_SIZE + exact + OW_CIS_SIGNATURE_SIZE;
+      b.bytes[0x08] = (uint8_t)(total & 0xFFu);
+      b.bytes[0x09] = (uint8_t)((total >> 8) & 0xFFu);
+      b.bytes[0x0A] = (uint8_t)((total >> 16) & 0xFFu);
+      b.bytes[0x0B] = (uint8_t)((total >> 24) & 0xFFu);
+      b.bytes[0x0C] = (uint8_t)(exact & 0xFFu);
+      b.bytes[0x0D] = (uint8_t)((exact >> 8) & 0xFFu);
+      b.bytes[0x0E] = (uint8_t)((exact >> 16) & 0xFFu);
+      b.bytes[0x0F] = (uint8_t)((exact >> 24) & 0xFFu);
+    }
+    cis_check_parse("manifest_size exactly at the sanity bound", &b, b.size,
+                    OW_CIS_FORMAT_BAD_BLOCK_SIZE);
+  }
+
+  /* ---- the domain separator -------------------------------------------- */
+  {
+    b = good;
+    b.bytes[OW_CIS_BLOCK_HEADER_SIZE] = 'X';
+    cis_check_parse("manifest prefix altered", &b, b.size,
+                    OW_CIS_FORMAT_BAD_PREFIX);
+    b = good;
+    b.bytes[OW_CIS_BLOCK_HEADER_SIZE + 22u] = ' ';
+    cis_check_parse("manifest prefix last character altered", &b, b.size,
+                    OW_CIS_FORMAT_BAD_PREFIX);
+    /* The 9 bytes of padding after the 23-character prefix are signed too, so
+     * a non-zero byte there is a different domain rather than an equivalent
+     * encoding. */
+    b = good;
+    b.bytes[OW_CIS_BLOCK_HEADER_SIZE + 23u] = 0x01u;
+    cis_check_parse("manifest prefix padding not zero", &b, b.size,
+                    OW_CIS_FORMAT_BAD_PREFIX);
+    b = good;
+    b.bytes[OW_CIS_BLOCK_HEADER_SIZE + 31u] = 0x01u;
+    cis_check_parse("the last prefix padding byte non-zero", &b, b.size,
+                    OW_CIS_FORMAT_BAD_PREFIX);
+  }
+
+  /* ---- TLV ordering ----------------------------------------------------- */
+  {
+    cis_test_block m;
+    uint32_t at;
+
+    /* The first tag raised above the second. */
+    if (cis_test_build_manifest(&m)) {
+      at = cis_test_find_tlv(&m, OW_CIS_TAG_LICENSE);
+      if (at != 0xFFFFFFFFu && at >= 4u) {
+        m.bytes[at - 4u] = 0x09u;   /* 0x0009 > 0x0002 */
+        m.bytes[at - 3u] = 0x00u;
+        cis_check_manifest_parse("a tag raised above its successor", &m,
+                        OW_CIS_FORMAT_TAGS_NOT_ASCENDING);
+      }
+    }
+
+    /* The same tag twice, with the second occurrence strictly higher: not a
+     * duplicate but a reordering, and it must fail as one. */
+    if (cis_test_build_manifest(&m)) {
+      static const uint8_t extra[2] = {'h', 'i'};
+      (void)cis_test_put_tlv(&m, OW_CIS_TAG_BUILD_ID, extra, 2u);
+      (void)cis_test_put_tlv(&m, OW_CIS_TAG_LICENSE, extra, 2u);
+      cis_check_manifest_parse("a tag repeated below its successor", &m,
+                      OW_CIS_FORMAT_TAGS_NOT_ASCENDING);
+    }
+
+/* The same tag twice, adjacent, with equal values: a duplicate.  Adjacency is
+     * what makes this a duplicate rather than a reordering -- a repeated tag
+     * below its successor is the previous case, and must be reported
+     * differently, because "this appears twice" and "these are out of order"
+     * are different defects even though both are refused. */
+    if (cis_test_build_manifest(&m)) {
+      (void)cis_test_put_tlv(&m, OW_CIS_TAG_BUILD_ID,
+                             (const uint8_t *)"hi", 2u);
+      (void)cis_test_put_tlv(&m, OW_CIS_TAG_BUILD_ID,
+                             (const uint8_t *)"hi", 2u);
+      cis_check_manifest_parse("a tag repeated exactly", &m,
+                               OW_CIS_FORMAT_DUPLICATE_TAG);
+    }
+
+    /* A TLV header with no room for a value. */
+    if (cis_test_build_manifest(&m)) {
+      (void)cis_test_put_u16(&m, 0x0080u);
+      cis_check_manifest_parse("a TLV header with nothing after it", &m,
+                      OW_CIS_FORMAT_TAGS_NOT_ASCENDING);
+    }
+  }
+
+  /* ---- required tags ---------------------------------------------------- */
+  {
+    /* One required tag removed at a time.  The length comes from the manifest
+     * rather than from a literal, because a literal one byte too long turns the
+     * closing memmove into a size_t underflow. */
+    static const struct {
+      uint16_t tag;
+      const char *label;
+    } required[] = {
+        {OW_CIS_TAG_LICENSE, "the licence tag removed"},
+        {OW_CIS_TAG_DIGEST_ALGO, "the digest-algo tag removed"},
+        {OW_CIS_TAG_KEY_ID, "the key id tag removed"},
+        {OW_CIS_TAG_CONTENT_DIGEST, "the content digest tag removed"},
+        {OW_CIS_TAG_COPYRIGHT, "the copyright tag removed"}
+    };
+    uint32_t i;
+
+    for (i = 0U; i < sizeof(required) / sizeof(required[0]); i++) {
+      cis_test_block m;
+      if (!cis_test_build_manifest(&m)) {
+        ++g_failures;
+        printf("[FAIL] %s: could not build the reference manifest\n",
+               required[i].label);
+        continue;
+      }
+      if (!cis_test_remove_tlv(&m, required[i].tag)) {
+        ++g_failures;
+        printf("[FAIL] %s: could not remove tag 0x%04x\n", required[i].label,
+               required[i].tag);
+        continue;
+      }
+      cis_check_manifest_parse(required[i].label, &m,
+                      OW_CIS_FORMAT_MISSING_REQUIRED_TAG);
+    }
+
+    /* Two required tags removed at once: still one missing-tag answer, not a
+     * different one. */
+    {
+      cis_test_block m;
+      if (cis_test_build_manifest(&m)) {
+        (void)cis_test_remove_tlv(&m, OW_CIS_TAG_LICENSE);
+        (void)cis_test_remove_tlv(&m, OW_CIS_TAG_COPYRIGHT);
+        cis_check_manifest_parse("two required tags removed", &m,
+                        OW_CIS_FORMAT_MISSING_REQUIRED_TAG);
+      }
+    }
+
+    /* Only the optional tag removed: everything required is still there, so
+     * this must still parse.  It is the other half of the missing-tag rule --
+     * without it, a parser that wrongly required build-id would pass every case
+     * above.  The tag is appended first, since the reference manifest has none. */
+    {
+      cis_test_block m;
+      if (cis_test_build_manifest(&m)) {
+        (void)cis_test_put_tlv(&m, OW_CIS_TAG_BUILD_ID,
+                               (const uint8_t *)"build-1", 7u);
+        if (cis_test_remove_tlv(&m, OW_CIS_TAG_BUILD_ID)) {
+          cis_check_manifest_parse("the optional build-id removed", &m,
+                          OW_CIS_FORMAT_OK);
+        } else {
+          ++g_failures;
+          printf("[FAIL] could not remove the optional build-id tag\n");
+        }
+      }
+    }
+  }
+
+  /* ---- tag widths and lengths ------------------------------------------ */
+  {
+    cis_test_block m;
+    uint32_t at;
+
+    /* A binary tag with too few bytes. */
+    if (cis_test_build_manifest(&m)) {
+      at = cis_test_find_tlv(&m, OW_CIS_TAG_DIGEST_ALGO);
+      if (at != 0xFFFFFFFFu) {
+        m.bytes[at - 2u] = 3U;
+        m.bytes[at - 1u] = 0U;
+        cis_check_manifest_parse("digest-algo declared one byte short", &m,
+                        OW_CIS_FORMAT_BAD_TAG_LENGTH);
+      }
+    }
+    if (cis_test_build_manifest(&m)) {
+      at = cis_test_find_tlv(&m, OW_CIS_TAG_KEY_ID);
+      if (at != 0xFFFFFFFFu) {
+        m.bytes[at - 2u] = (uint8_t)(OW_CIS_KEY_ID_SIZE - 1u);
+        m.bytes[at - 1u] = 0U;
+        cis_check_manifest_parse("key id declared one byte short", &m,
+                        OW_CIS_FORMAT_BAD_TAG_LENGTH);
+      }
+    }
+    if (cis_test_build_manifest(&m)) {
+      at = cis_test_find_tlv(&m, OW_CIS_TAG_CONTENT_DIGEST);
+      if (at != 0xFFFFFFFFu) {
+        m.bytes[at - 2u] = (uint8_t)(OW_SHA256_DIGEST_SIZE + 1u);
+        m.bytes[at - 1u] = 0U;
+        cis_check_manifest_parse("content digest declared one byte long", &m,
+                        OW_CIS_FORMAT_BAD_TAG_LENGTH);
+      }
+    }
+    /* A value length running past the end of the manifest. */
+    if (cis_test_build_manifest(&m)) {
+      at = cis_test_find_tlv(&m, OW_CIS_TAG_LICENSE);
+      if (at != 0xFFFFFFFFu) {
+        m.bytes[at - 2u] = 0xFFu;
+        m.bytes[at - 1u] = 0xFFu;
+        cis_check_manifest_parse("a value length past the manifest", &m,
+                        OW_CIS_FORMAT_BAD_TAG_LENGTH);
+      }
+    }
+    /* A length whose high byte is set, which is where a 16-bit overflow would
+     * hide if the subtraction were done in 16 bits. */
+    if (cis_test_build_manifest(&m)) {
+      at = cis_test_find_tlv(&m, OW_CIS_TAG_LICENSE);
+      if (at != 0xFFFFFFFFu) {
+        m.bytes[at - 2u] = 0x00u;
+        m.bytes[at - 1u] = 0x80u;
+        cis_check_manifest_parse("a value length of 0x8000", &m,
+                        OW_CIS_FORMAT_BAD_TAG_LENGTH);
+      }
+    }
+  }
+
+  /* ---- NUL inside a value ---------------------------------------------- */
+  /* The NUL rule is for text values.  A binary value may hold any byte, and the
+   * digest algorithm already proves why: it is 01 00 00 00 little-endian. */
+  {
+    static const uint8_t with_nul[5] = {'M', 'I', 'T', 0x00u, 'X'};
+    cis_check_extra_tlv("a NUL inside a text value", &manifest,
+                        OW_CIS_TAG_BUILD_ID, with_nul, 5u,
+                        OW_CIS_FORMAT_VALUE_HAS_NUL);
+    cis_check_extra_tlv("a NUL as the first byte of a text value", &manifest,
+                        OW_CIS_TAG_BUILD_ID, with_nul, 4u,
+                        OW_CIS_FORMAT_VALUE_HAS_NUL);
+    {
+      /* A binary value may hold any byte.  Appended under an unknown tag so it
+       * cannot collide with the real key-id tag: the point is that a NUL is
+       * not what makes a binary value legal, its width is. */
+      static const uint8_t all_zero[OW_CIS_KEY_ID_SIZE] = {0U};
+      cis_check_extra_tlv("an all-zero binary value is legal", &manifest,
+                          0x0F01u, all_zero, (uint16_t)sizeof(all_zero),
+                          OW_CIS_FORMAT_OK);
+    }
+    {
+      /* An unknown tag's value is skipped, so the text rules do not apply to it:
+       * the rules protect values the verifier reads.  Stated as a test so the
+       * two cases cannot be conflated later. */
+      static const uint8_t opaque[4] = {0xDEu, 0xADu, 0x00u, 0xBEu};
+      cis_check_extra_tlv("a NUL inside an unknown tag's value", &manifest,
+                          0x0F00u, opaque, 4u, OW_CIS_FORMAT_OK);
+    }
+    {
+      static const uint8_t bad_utf8[3] = {0xFFu, 0xFFu, 0xFFu};
+      cis_check_extra_tlv("invalid UTF-8 inside an unknown tag's value",
+                          &manifest, 0x0F00u, bad_utf8, 3u,
+                          OW_CIS_FORMAT_OK);
+    }
+  }
+
+  /* ---- UTF-8 in text tags ---------------------------------------------- */
+  {
+    static const uint8_t overlong2[3] = {0xC1u, 0x81u, 0x42u};
+    static const uint8_t overlong3[3] = {0xE0u, 0x80u, 0x41u};
+    static const uint8_t overlong4[4] = {0xF0u, 0x80u, 0x80u, 0x41u};
+    static const uint8_t surrogate[3] = {0xEDu, 0xA0u, 0x80u};
+    static const uint8_t too_high[4] = {0xF4u, 0x90u, 0x80u, 0x80u};
+    static const uint8_t lone_cont[1] = {0x80u};
+    static const uint8_t truncated[2] = {0xE2u, 0x82u};
+    static const uint8_t bad_cont[3] = {0xE2u, 0x82u, 0x41u};
+    /* U+00E9, U+20AC, U+1F600: the boundaries a validator has to get right for
+     * the rule above to be a UTF-8 rule and not "reject everything above
+     * ASCII". */
+    static const uint8_t valid[9] = {0xC3u, 0xA9u,              /* e-acute */
+                                     0xE2u, 0x82u, 0xACu,       /* euro    */
+                                     0xF0u, 0x9Fu, 0x98u, 0x80u};
+
+    cis_check_extra_tlv("an overlong two-byte sequence", &manifest,
+                        OW_CIS_TAG_BUILD_ID, overlong2, 3u,
+                        OW_CIS_FORMAT_VALUE_NOT_SUTF);
+    cis_check_extra_tlv("an overlong three-byte sequence", &manifest,
+                        OW_CIS_TAG_BUILD_ID, overlong3, 3u,
+                        OW_CIS_FORMAT_VALUE_NOT_SUTF);
+    cis_check_extra_tlv("an overlong four-byte sequence", &manifest,
+                        OW_CIS_TAG_BUILD_ID, overlong4, 4u,
+                        OW_CIS_FORMAT_VALUE_NOT_SUTF);
+    cis_check_extra_tlv("a UTF-16 surrogate", &manifest,
+                        OW_CIS_TAG_BUILD_ID, surrogate, 3u,
+                        OW_CIS_FORMAT_VALUE_NOT_SUTF);
+    cis_check_extra_tlv("a code point above U+10FFFF", &manifest,
+                        OW_CIS_TAG_BUILD_ID, too_high, 4u,
+                        OW_CIS_FORMAT_VALUE_NOT_SUTF);
+    cis_check_extra_tlv("a lone continuation byte", &manifest,
+                        OW_CIS_TAG_BUILD_ID, lone_cont, 1u,
+                        OW_CIS_FORMAT_VALUE_NOT_SUTF);
+    cis_check_extra_tlv("a sequence truncated at the end of the value",
+                        &manifest, OW_CIS_TAG_BUILD_ID, truncated, 2u,
+                        OW_CIS_FORMAT_VALUE_NOT_SUTF);
+    cis_check_extra_tlv("a bad continuation byte", &manifest,
+                        OW_CIS_TAG_BUILD_ID, bad_cont, 3u,
+                        OW_CIS_FORMAT_VALUE_NOT_SUTF);
+    cis_check_extra_tlv("valid multi-byte UTF-8", &manifest,
+                        OW_CIS_TAG_BUILD_ID, valid, 9u, OW_CIS_FORMAT_OK);
+  }
+
+  /* ---- unknown tags ---------------------------------------------------- */
+  {
+    static const uint8_t opaque[6] = {0xDEu, 0xADu, 0xBEu, 0xEFu, 0x01u, 0x02u};
+    /* Forward compatibility is why the rule is "skip what you do not
+     * understand", not "refuse it". */
+    cis_check_extra_tlv("an unknown tag above every known tag", &manifest,
+                        0xFFFFu, opaque, 6u, OW_CIS_FORMAT_OK);
+    cis_check_extra_tlv("an empty unknown tag", &manifest, 0x0F00u, opaque, 0u,
+                        OW_CIS_FORMAT_OK);
+    cis_check_extra_tlv("an unknown tag holding binary, not text", &manifest,
+                        0x0F00u, opaque, 6u, OW_CIS_FORMAT_OK);
+
+    /* An unknown tag below every known tag has to be inserted rather than
+     * appended, because ascending order means it cannot be appended at all.  It
+     * is the case that matters for forward compatibility: a verifier built
+     * before a tag existed still has to accept a manifest that uses it. */
+    {
+      cis_test_block m;
+      cis_test_block ins;
+      const uint32_t at = OW_CIS_MANIFEST_PREFIX_SIZE;
+
+      memset(&ins, 0, sizeof(ins));
+      if (cis_test_build_manifest(&m) &&
+          cis_test_put_tlv(&ins, 0x0000u, opaque, 6u)) {
+        /* Insert right after the prefix, shifting the rest up. */
+        memmove(&m.bytes[at + ins.size], &m.bytes[at], m.size - at);
+        memcpy(&m.bytes[at], ins.bytes, ins.size);
+        m.size += ins.size;
+        cis_check_manifest_parse("an unknown tag below every known tag", &m,
+                                 OW_CIS_FORMAT_OK);
+      }
+    }
+  }
+
+  /* ---- digest algorithm ------------------------------------------------ */
+  {
+    cis_test_block m;
+    uint32_t at;
+
+    if (cis_test_build_manifest(&m)) {
+      at = cis_test_find_tlv(&m, OW_CIS_TAG_DIGEST_ALGO);
+      if (at != 0xFFFFFFFFu) {
+        m.bytes[at] = 2U;
+        cis_check_manifest_parse("digest algorithm 2", &m,
+                        OW_CIS_FORMAT_UNSUPPORTED_DIGEST_ALGO);
+      }
+    }
+    if (cis_test_build_manifest(&m)) {
+      at = cis_test_find_tlv(&m, OW_CIS_TAG_DIGEST_ALGO);
+      if (at != 0xFFFFFFFFu) {
+        m.bytes[at] = 0U;
+        cis_check_manifest_parse("digest algorithm 0", &m,
+                        OW_CIS_FORMAT_UNSUPPORTED_DIGEST_ALGO);
+      }
+    }
+    if (cis_test_build_manifest(&m)) {
+      at = cis_test_find_tlv(&m, OW_CIS_TAG_DIGEST_ALGO);
+      if (at != 0xFFFFFFFFu) {
+        m.bytes[at] = 0xFFu;
+        cis_check_manifest_parse("digest algorithm 255", &m,
+                        OW_CIS_FORMAT_UNSUPPORTED_DIGEST_ALGO);
+      }
+    }
+  }
+
+  /* ---- the UTF-8 validator, driven directly --------------------------- */
+  /* Reachable directly because a validator that can only be exercised through a
+   * full parse cannot be handed a case the surrounding lengths would reject
+   * first. */
+  {
+    static const struct {
+      const char *label;
+      uint8_t data[5];
+      uint8_t size;
+      bool want;
+    } cases[] = {
+        {"empty", {0U}, 0U, true},
+        {"ascii", {'o', 'k', 0U}, 2U, true},
+        {"all seven-bit bytes", {0x01u, 0x7Fu, 0x41u}, 3U, true},
+        {"NUL", {0x00u}, 1U, false},
+        {"0x80 lone continuation", {0x80u}, 1U, false},
+        {"0xBF lone continuation", {0xBFu}, 1U, false},
+        {"0xC0 overlong", {0xC0u, 0x80u}, 2U, false},
+        {"0xC1 overlong", {0xC1u, 0x80u}, 2U, false},
+        {"0xC2 0x80 lowest two-byte", {0xC2u, 0x80u}, 2U, true},
+        {"0xDF 0xBF highest two-byte", {0xDFu, 0xBFu}, 2U, true},
+        {"0xE0 0x9F overlong", {0xE0u, 0x9Fu, 0x80u}, 3U, false},
+        {"0xE0 0xA0 lowest three-byte", {0xE0u, 0xA0u, 0x80u}, 3U, true},
+        {"0xED 0x9F highest non-surrogate", {0xEDu, 0x9Fu, 0xBFu}, 3U, true},
+        {"0xED 0xA0 lowest surrogate", {0xEDu, 0xA0u, 0x80u}, 3U, false},
+        {"0xEF 0xBF 0xBF highest three-byte", {0xEFu, 0xBFu, 0xBFu}, 3U, true},
+        {"0xF0 0x8F overlong", {0xF0u, 0x8Fu, 0x80u, 0x80u}, 4U, false},
+        {"0xF0 0x90 lowest four-byte", {0xF0u, 0x90u, 0x80u, 0x80u}, 4U, true},
+        {"0xF4 0x8F 0xBF 0xBF is U+10FFFF", {0xF4u, 0x8Fu, 0xBFu, 0xBFu}, 4U, true},
+        {"0xF4 0x90 above U+10FFFF", {0xF4u, 0x90u, 0x80u, 0x80u}, 4U, false},
+        {"0xF5 out of range", {0xF5u, 0x80u, 0x80u, 0x80u}, 4U, false},
+        {"0xFF out of range", {0xFFu}, 1U, false},
+        {"two-byte lead at end", {0xC3u}, 1U, false},
+        {"three-byte lead one short", {0xE2u, 0x82u}, 2U, false},
+        {"four-byte lead one short", {0xF0u, 0x9Fu, 0x98u}, 3U, false},
+        {"bad continuation after two-byte", {0xC3u, 0x41u}, 2U, false},
+        {"bad continuation after three-byte", {0xE2u, 0x82u, 0x41u}, 3U, false},
+        {"bad continuation after four-byte", {0xF0u, 0x9Fu, 0x41u, 0x80u}, 4U,
+         false},
+        {"text then a bad sequence", {'a', 'b', 0xFFu}, 3U, false},
+        {"good then a bad sequence", {0xC3u, 0xA9u, 0xFFu}, 3U, false},
+        {"a bad sequence then good text", {0xFFu, 'a', 'b'}, 3U, false}
+    };
+    const uint32_t n = (uint32_t)(sizeof(cases) / sizeof(cases[0]));
+    uint32_t i;
+
+    for (i = 0U; i < n; i++) {
+      const bool got = OwCisFormatIsValidSutf(cases[i].data, cases[i].size);
+      if (got == cases[i].want) {
+        ++g_passed;
+      } else {
+        ++g_failures;
+        printf("[FAIL] UTF-8 %s: got %s, want %s\n", cases[i].label,
+               got ? "true" : "false", cases[i].want ? "true" : "false");
+      }
+    }
+    printf("[PASS] %u UTF-8 cases\n", (unsigned)n);
+  }
+
+  /* ---- the NUL helper, driven directly -------------------------------- */
+  {
+    static const uint8_t clean[4] = {'a', 'b', 'c', 'd'};
+    static const uint8_t middle[4] = {'a', 0x00u, 'c', 'd'};
+    static const uint8_t leading[4] = {0x00u, 'b', 'c', 'd'};
+    static const uint8_t trailing[4] = {'a', 'b', 'c', 0x00u};
+    check_window("HasNoNul accepts a clean value",
+                 OwCisFormatHasNoNul(clean, 4u), true);
+    check_window("HasNoNul accepts an empty value",
+                 OwCisFormatHasNoNul(clean, 0u), true);
+    check_window("HasNoNul rejects a NUL in the middle",
+                 OwCisFormatHasNoNul(middle, 4u), false);
+    check_window("HasNoNul rejects a leading NUL",
+                 OwCisFormatHasNoNul(leading, 4u), false);
+    check_window("HasNoNul rejects a trailing NUL",
+                 OwCisFormatHasNoNul(trailing, 4u), false);
+    /* The first byte alone is not a NUL, so a one-byte window over it is
+     * clean: the helper scans what it is given, not the whole buffer. */
+    check_window("HasNoNul reads only the length it is given",
+                 OwCisFormatHasNoNul(middle, 1u), true);
+  }
+
+  /* ---- little-endian readers ------------------------------------------ */
+  {
+    static const uint8_t le16[2] = {0x34u, 0x12u};
+    static const uint8_t le32[4] = {0x78u, 0x56u, 0x34u, 0x12u};
+    static const uint8_t ones[4] = {0xFFu, 0xFFu, 0xFFu, 0xFFu};
+    check_eq("u16 reads little-endian", OwCisFormatReadU16(le16), 0x1234u);
+    check_eq("u32 reads little-endian", OwCisFormatReadU32(le32), 0x12345678u);
+    check_eq("u32 of all ones", OwCisFormatReadU32(ones), 0xFFFFFFFFu);
+  }
+
+  printf("--- CIS block format verified\n");
+}
+
+static void test_cis_core(void) {
+  const OW_CIS_POLICY *policy;
+  const OW_CIS_TRUST_KEY *found;
+  const OW_CIS_RECORD *last;
+  uint8_t public_key[OW_CIS_PUBLIC_KEY_SIZE];
+  uint8_t other_key[OW_CIS_PUBLIC_KEY_SIZE];
+  uint8_t key_id[OW_CIS_KEY_ID_SIZE];
+  char long_name[OW_CIS_NAME_SIZE + 64];
+  uint32_t i;
+  uint32_t before;
+
+  printf("\n=== Copyleft Integrity Safeguard: enforcement state ===\n");
+
+  /* ---- armed --------------------------------------------------------- */
+  check_window("CIS is armed", OwCisIsReady(), true);
+
+  policy = OwCisPolicy();
+  check_window("CIS policy requires a signature", policy->RequireSignature,
+               true);
+  check_window("CIS policy refuses unsigned recovery by default",
+               policy->AllowUnsignedRecovery, false);
+  check_window("CIS policy bounds image size",
+               policy->MaxImageSize > 0U, true);
+
+  /* ---- fail closed with no trust anchors ------------------------------ */
+  /* A default build pins zero keys: nothing may be trusted, and the subsystem
+   * must say so through its own state rather than by accident.
+   *
+   * A CIS_DEV_TRUST build pins exactly the one dev anchor, and that is a
+   * different assertion rather than a weakened one -- so the count is checked
+   * against what the build was configured to pin, and the "nothing is trusted"
+   * claims below only hold in the default case.  The alternative, pinning the
+   * count to zero unconditionally, would have made this test fail under the
+   * opt-in and invited someone to special-case it away. */
+  {
+    const unsigned long pinned = (unsigned long)OwCisTrustedKeyCount();
+#ifdef CIS_DEV_TRUST
+    const unsigned long expected = 1UL;
+
+    check_eq("a CIS_DEV_TRUST build pins exactly the dev anchor", pinned,
+             expected);
+    /* Every pinned anchor must be marked test-only.  Asserted by iterating
+     * rather than by looking up the dev key id, because that is the property
+     * that actually matters: a build carrying the dev anchor must not be able to
+     * carry one that is not flagged as non-production. */
+    {
+      int all_test_only = 1;
+      for (i = 0; i < (uint32_t)pinned; i++) {
+        const OW_CIS_TRUST_KEY *k = OwCisTrustedKeyAt(i);
+        if (k == NULL || (k->Flags & OW_CIS_KEY_FLAG_TEST_ONLY) == 0U) {
+          all_test_only = 0;
+        }
+      }
+      check_window("every pinned anchor in a CIS_DEV_TRUST build is test-only",
+                   all_test_only, true);
+    }
+#else
+    const unsigned long expected = 0UL;
+
+    check_eq("a default build pins no trust anchors", pinned, expected);
+    check_window("no trust anchors means no lookup hits",
+                 OwCisLookupKey(public_key) != NULL, false);
+    check_window("no trust anchors means no key-id hits",
+                 OwCisLookupKeyId(key_id) != NULL, false);
+#endif
+
+    /* Overridable so the fill loop and the counts after it stay correct without
+     * repeating this #ifdef. */
+    g_CisHarnessPinned = expected;
+  }
+  check_window("only TRUSTED permits execution",
+               OwCisVerdictAllowsExecution(OW_CIS_VERDICT_TRUSTED), true);
+  check_window("UNSIGNED does not permit execution",
+               OwCisVerdictAllowsExecution(OW_CIS_VERDICT_REJECT_UNSIGNED),
+               false);
+  check_window("UNKNOWN-KEY does not permit execution",
+               OwCisVerdictAllowsExecution(OW_CIS_VERDICT_REJECT_UNKNOWN_KEY),
+               false);
+  check_window("ERROR does not permit execution",
+               OwCisVerdictAllowsExecution(OW_CIS_VERDICT_ERROR), false);
+
+  /* ---- initialization is idempotent and preserves history ------------- */
+  before = OwCisRecordCount();
+  check_eq("re-initializing CIS succeeds", (unsigned long)OwCisInitialize(),
+           (unsigned long)OW_SUCCESS);
+  check_eq("re-initializing CIS preserves the measurement log",
+           OwCisRecordCount(), before);
+
+  /* ---- measurement log ------------------------------------------------ */
+  OwCisResetRecords();
+  check_eq("measurement log starts empty", OwCisRecordCount(), 0);
+
+  for (i = 0; i < OW_CIS_PUBLIC_KEY_SIZE; i++) {
+    public_key[i] = (uint8_t)(0xA0 + i);
+    other_key[i] = (uint8_t)(0x10 + i);
+  }
+  for (i = 0; i < OW_CIS_KEY_ID_SIZE; i++) {
+    key_id[i] = (uint8_t)(0x30 + i);
+  }
+
+  for (i = 0; i < OW_CIS_MAX_RECORDS; i++) {
+    OW_CIS_VERDICT verdict = (i % 2u == 0u) ? OW_CIS_VERDICT_TRUSTED
+                                            : OW_CIS_VERDICT_REJECT_UNSIGNED;
+    OW_STATUS st = OwCisRecordVerdict("probe.owx", public_key, 4096u, 0x04u,
+                                      0u, OW_CIS_RECORD_BOOT, verdict,
+                                      OW_SUCCESS, key_id);
+    if (!ow_status_success(st)) {
+      ++g_failures;
+      printf("[FAIL] recording measurement %u: 0x%X\n", (unsigned)i,
+             (unsigned)st);
+      return;
+    }
+  }
+  check_eq("measurement log holds a full table", OwCisRecordCount(),
+           OW_CIS_MAX_RECORDS);
+  check_eq("rejections counted separately", OwCisRejectedCount(),
+           OW_CIS_MAX_RECORDS / 2u);
+  check_eq("a full measurement table refuses new entries",
+           (unsigned long)OwCisRecordVerdict("overflow.owx", public_key, 1u,
+                                             0x04u, 0u, 0u,
+                                             OW_CIS_VERDICT_TRUSTED, OW_SUCCESS,
+                                             key_id),
+           (unsigned long)OW_ERR_INSUFFICIENT);
+  check_eq("refusing a new entry did not grow the log", OwCisRecordCount(),
+           OW_CIS_MAX_RECORDS);
+
+  last = OwCisLastRejection();
+  check_window("last rejection is retrievable", last != NULL, true);
+  if (last) {
+    check_eq("last rejection reports its verdict", (unsigned long)last->Verdict,
+             (unsigned long)OW_CIS_VERDICT_REJECT_UNSIGNED);
+    check_window("last rejection kept the image name",
+                 ow_strlen(last->Image) > 0, true);
+  }
+  check_window("a record past the end reads as NULL",
+               OwCisRecordAt(OW_CIS_MAX_RECORDS) != NULL, false);
+  check_eq("a NULL image name is refused",
+           (unsigned long)OwCisRecordVerdict(NULL, public_key, 1u, 0x04u, 0u,
+                                             0u, OW_CIS_VERDICT_TRUSTED,
+                                             OW_SUCCESS, key_id),
+           (unsigned long)OW_ERR_NULL_POINTER);
+
+  /* ---- an over-long name is truncated, not walked --------------------- */
+  for (i = 0; i < sizeof(long_name) - 1u; i++) {
+    long_name[i] = 'x';
+  }
+  long_name[sizeof(long_name) - 1u] = '\0';
+  OwCisResetRecords();
+  (void)OwCisRecordVerdict(long_name, public_key, 1u, 0x04u, 0u, 0u,
+                           OW_CIS_VERDICT_TRUSTED, OW_SUCCESS, key_id);
+  last = OwCisRecordAt(0);
+  check_window("measurement recorded after truncation", last != NULL, true);
+  if (last) {
+    check_eq("an over-long image name is bounded, not overrun",
+             ow_strlen(last->Image), OW_CIS_NAME_SIZE - 1u);
+  }
+
+  /* ---- trust store lookups -------------------------------------------- */
+  OwCisResetRecords();
+  check_eq("injecting a test trust anchor succeeds",
+           (unsigned long)OwCisTestInjectKey("harness", public_key, key_id,
+                                             OW_CIS_KEY_FLAG_TEST_ONLY),
+           (unsigned long)OW_SUCCESS);
+  check_eq("the injected anchor is in the store",
+           (unsigned long)OwCisTrustedKeyCount(), g_CisHarnessPinned + 1UL);
+  found = OwCisLookupKey(public_key);
+  check_window("lookup by public key finds it", found != NULL, true);
+  found = OwCisLookupKeyId(key_id);
+  check_window("lookup by key id finds it", found != NULL, true);
+  check_window("a different public key does not match",
+               OwCisLookupKey(other_key) != NULL, false);
+  if (found) {
+    check_window("the injected anchor is marked test-only",
+                 (found->Flags & OW_CIS_KEY_FLAG_TEST_ONLY) != 0u, true);
+    check_window("the injected anchor starts unrevoked", found->Revoked,
+                 false);
+  }
+  for (i = OwCisTrustedKeyCount(); i < OW_CIS_MAX_TRUST_KEYS; i++) {
+    uint8_t filler[OW_CIS_PUBLIC_KEY_SIZE];
+    for (uint32_t b = 0; b < OW_CIS_PUBLIC_KEY_SIZE; b++) {
+      filler[b] = (uint8_t)(0xE0 ^ b ^ i);
+    }
+    (void)OwCisTestInjectKey("filler", filler, key_id,
+                             OW_CIS_KEY_FLAG_TEST_ONLY);
+  }
+  check_eq("the trust store fills to its capacity", OwCisTrustedKeyCount(),
+           OW_CIS_MAX_TRUST_KEYS);
+  check_eq("injection past the table capacity is refused",
+           (unsigned long)OwCisTestInjectKey("overflow", other_key, key_id,
+                                             OW_CIS_KEY_FLAG_TEST_ONLY),
+           (unsigned long)OW_ERR_INSUFFICIENT);
+
+  OwCisTestClearInjected();
+  check_eq("clearing injected anchors restores the pinned set",
+           OwCisTrustedKeyCount(), OW_CIS_PINNED_KEY_COUNT);
+  check_window("a cleared anchor no longer matches",
+               OwCisLookupKey(public_key) != NULL, false);
+
+  /* ---- policy relaxation is separate from signature enforcement ------- */
+  check_eq("unsigned recovery can be relaxed explicitly",
+           (unsigned long)OwCisSetUnsignedRecoveryAllowed(true),
+           (unsigned long)OW_SUCCESS);
+  check_window("the relaxation took effect",
+               OwCisPolicy()->AllowUnsignedRecovery, true);
+  check_window("relaxing recovery does not relax the signature requirement",
+               OwCisPolicy()->RequireSignature, true);
+  (void)OwCisSetUnsignedRecoveryAllowed(false);
+
+  printf("--- CIS stage 1 state verified\n");
+}
+
+/* -------------------------------------------------------------------- */
+/* Ed25519 regression tests                                             */
+/* -------------------------------------------------------------------- */
+/*
+ * These exist because a signature-level known-answer test can only say
+ * "rejected".  Every bug found while writing lib/ow_ed25519.c was invisible at
+ * that level and obvious one level down, so the tests are layered:
+ *
+ *   SHA-512      what every signature is built on
+ *   field        add / sub / mul, where a bad carry or borrow shows up
+ *   scalar       reduction mod L, including the exactly-L case
+ *   points       decoding, canonicality, the group law, [L]B
+ *   constants    identities the frozen constants have to satisfy
+ *   verify       the top layer, and the only one the kernel uses
+ *
+ * Expected values come from crypto_vectors.h, generated by
+ * tools/gen_crypto_vectors.py from tools/cis_sign.py -- a separate derivation of
+ * the same curve that shares no code with the C.  Two independent derivations
+ * agreeing is stronger evidence than one implementation agreeing with a table,
+ * because a table cannot tell you whether it was ever right.
+ */
+
+static void check_bytes(const char *label, const uint8_t *got,
+                        const uint8_t *want, size_t len) {
+  size_t i;
+  for (i = 0; i < len; i++) {
+    if (got[i] != want[i]) {
+      ++g_failures;
+      printf("[FAIL] %s: byte %u is 0x%02x, want 0x%02x\n", label, (unsigned)i,
+             got[i], want[i]);
+      return;
+    }
+  }
+  ++g_passed;
+  printf("[PASS] %s\n", label);
+}
+
+/* Byte-exact comparison that names the vector index, for the table-driven loops
+ * where one assertion runs hundreds of times.  Reports the first mismatching
+ * byte, so a failure identifies the operand that produced it. */
+static void check_bytes_v(const char *what, uint32_t index, const uint8_t *got,
+                          const uint8_t *want, size_t len) {
+  size_t i;
+  for (i = 0; i < len; i++) {
+    if (got[i] != want[i]) {
+      ++g_failures;
+      printf("[FAIL] %s vector %u: byte %u is 0x%02x, want 0x%02x\n", what,
+             (unsigned)index, (unsigned)i, got[i], want[i]);
+      return;
+    }
+  }
+  ++g_passed;
+  printf("[PASS] %s vector %u\n", what, (unsigned)index);
+}
+
+static const uint8_t *field_const(const char *name) {
+  uint32_t i;
+  for (i = 0U; i < OW_FIELD_CONSTANT_COUNT; i++) {
+    if (strcmp(ow_field_constants[i].name, name) == 0) {
+      return ow_field_constants[i].value;
+    }
+  }
+  ++g_failures;
+  printf("[FAIL] field constant \"%s\" is missing from the vector set\n", name);
+  return ow_field_constants[0].value;
+}
+
+/* The field element 1 as a readable operand.  ow_ed_test_fe_one() only fills an
+ * output, and several identities below need to compare against one, so it is
+ * named once here.  ow_ed_test_fe is an array type, so it decays to a pointer at
+ * each use -- that is intended, not an oversight. */
+static const ow_ed_test_fe k_field_one = {1U};
+
+static const uint8_t *point_const(const char *name) {
+  uint32_t i;
+  for (i = 0U; i < OW_POINT_CONSTANT_COUNT; i++) {
+    if (strcmp(ow_point_constants[i].name, name) == 0) {
+      return ow_point_constants[i].enc;
+    }
+  }
+  ++g_failures;
+  printf("[FAIL] point constant \"%s\" is missing from the vector set\n", name);
+  return ow_point_constants[0].enc;
+}
+
+/* True when the 32-byte little-endian value is strictly below p.  Every field
+ * result must satisfy this.  An unreduced or once-reduced result is a real
+ * defect that a comparison against the reference can miss, because two
+ * non-canonical forms of the same element are different byte strings -- and it
+ * is a defect that later signs bytes differently for the same value. */
+static bool fe_bytes_below_p(const uint8_t v[32]) {
+  const uint8_t *p = field_const("p");
+  int i;
+  for (i = 31; i >= 0; i--) {
+    if (v[i] != p[i]) {
+      return v[i] < p[i];
+    }
+  }
+  return false; /* equal to p is not below p */
+}
+
+/* ---- SHA-512 ------------------------------------------------------------- */
+
+static void test_sha512(void) {
+  uint8_t got[OW_SHA512_DIGEST_SIZE];
+  uint8_t whole[OW_SHA512_DIGEST_SIZE];
+  ow_sha512_ctx_t ctx;
+  uint32_t i;
+  size_t split;
+  uint32_t split_bad = 0U;
+
+  printf("\n=== SHA-512 (FIPS 180-4) ===\n");
+  printf("    %u known-answer vectors\n", (unsigned)OW_SHA512_VECTOR_COUNT);
+
+  for (i = 0U; i < OW_SHA512_VECTOR_COUNT; i++) {
+    const ow_sha512_vector *v = &ow_sha512_vectors[i];
+    ow_sha512(v->msg, v->msg_len, got);
+    check_bytes_v("SHA-512", i, got, v->want, sizeof(got));
+  }
+
+  /* Streaming must agree with one-shot at every split point.  Checking only the
+   * whole-buffer path leaves a defect in the update boundary or the buffer carry
+   * in place, and that is exactly where one hides: a message hashed in two
+   * pieces gives the same digest only if both halves are right. */
+  for (i = 0U; i < OW_SHA512_VECTOR_COUNT; i++) {
+    const ow_sha512_vector *v = &ow_sha512_vectors[i];
+    ow_sha512(v->msg, v->msg_len, whole);
+    for (split = 0U; split <= v->msg_len; split++) {
+      ow_sha512_init(&ctx);
+      ow_sha512_update(&ctx, v->msg, split);
+      ow_sha512_update(&ctx, v->msg + split, v->msg_len - split);
+      ow_sha512_final(&ctx, got);
+      if (memcmp(got, whole, sizeof(whole)) != 0) {
+        if (split_bad < 3U) {
+          printf("       vector %u: split at %u disagrees with one-shot\n",
+                 (unsigned)i, (unsigned)split);
+        }
+        ++split_bad;
+      }
+    }
+  }
+  check_window("streaming SHA-512 matches one-shot at every split point",
+               split_bad == 0U, true);
+
+  /* A zero-length update must be a no-op, including between real updates: the
+   * verifier hashes R, the public key and then a message that may be empty. */
+  {
+    static const uint8_t probe[8] = {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U};
+    ow_sha512_init(&ctx);
+    ow_sha512_update(&ctx, NULL, 0U);
+    ow_sha512_update(&ctx, probe, sizeof(probe));
+    ow_sha512_update(&ctx, NULL, 0U);
+    ow_sha512_update(&ctx, NULL, 0U);
+    ow_sha512_final(&ctx, got);
+    ow_sha512(probe, sizeof(probe), whole);
+    check_window("a zero-length update does not disturb the digest",
+                 memcmp(got, whole, sizeof(whole)) == 0, true);
+  }
+
+  printf("--- SHA-512 verified\n");
+}
+
+/* ---- field arithmetic ---------------------------------------------------- */
+/*
+ * The operand set is chosen so the arithmetic has to be correct rather than
+ * merely plausible.  Sixteen limbs of 16 bits span 2^256, and 2^256 is not
+ * congruent to zero mod p -- it is 38.  So a product that overflows limb 15 by
+ * more than one has to fold that carry back in scaled by 38, and a product above
+ * 2p has to be reduced more than once.  (P-1)*(P-1) and (P-1)*(P-2) are in the
+ * set for exactly that reason: they are the cases where a flat 38 instead of
+ * 38 * carry passes, and every other pair agrees.
+ */
+static void test_ed25519_field(void) {
+  ow_ed_test_fe a, b, got, want;
+  uint8_t buf[32];
+  uint32_t i;
+  uint32_t bad = 0U;
+  uint32_t noncanonical = 0U;
+  uint32_t rt_bad = 0U;
+
+  printf("\n=== Ed25519 field arithmetic over GF(2^255-19) ===\n");
+  printf("    %u field vectors, three operations each\n",
+         (unsigned)OW_FIELD_VECTOR_COUNT);
+
+  for (i = 0U; i < OW_FIELD_VECTOR_COUNT; i++) {
+    const ow_field_vector *v = &ow_field_vectors[i];
+
+    ow_ed_test_fe_decode(a, v->a);
+    ow_ed_test_fe_decode(b, v->b);
+
+    /* Operands must round-trip through the encoding helpers, or the comparisons
+     * below are not comparing what they claim to. */
+    ow_ed_test_fe_encode(buf, a);
+    if (memcmp(buf, v->a, 32) != 0) {
+      ++rt_bad;
+    }
+    ow_ed_test_fe_encode(buf, b);
+    if (memcmp(buf, v->b, 32) != 0) {
+      ++rt_bad;
+    }
+
+    ow_ed_test_fe_add(got, a, b);
+    ow_ed_test_fe_encode(buf, got);
+    if (memcmp(buf, v->add, 32) != 0) {
+      if (bad < 3U) {
+        printf("[FAIL] vector %u: add mismatch\n", (unsigned)i);
+      }
+      ++bad;
+    }
+    if (!fe_bytes_below_p(buf)) {
+      ++noncanonical;
+    }
+
+    /* a - b where a < b is the underflow path.  A limb-wise subtraction that
+     * borrows produces a wrapped result that is NOT congruent to (a-b) mod p,
+     * and adding p back to it cannot repair that; the only correct move is to
+     * compute the magnitude and return p - (b - a). */
+    ow_ed_test_fe_sub(got, a, b);
+    ow_ed_test_fe_encode(buf, got);
+    if (memcmp(buf, v->sub, 32) != 0) {
+      if (bad < 3U) {
+        printf("[FAIL] vector %u: sub mismatch\n", (unsigned)i);
+      }
+      ++bad;
+    }
+    if (!fe_bytes_below_p(buf)) {
+      ++noncanonical;
+    }
+
+    ow_ed_test_fe_mul(got, a, b);
+    ow_ed_test_fe_encode(buf, got);
+    if (memcmp(buf, v->mul, 32) != 0) {
+      if (bad < 3U) {
+        printf("[FAIL] vector %u: mul mismatch\n", (unsigned)i);
+      }
+      ++bad;
+    }
+    if (!fe_bytes_below_p(buf)) {
+      ++noncanonical;
+    }
+  }
+
+  if (rt_bad == 0U) {
+    ++g_passed;
+    printf("[PASS] every operand round-trips through its encoding\n");
+  } else {
+    g_failures += (int)rt_bad;
+    printf("[FAIL] %u operand round-trip failures\n", (unsigned)rt_bad);
+  }
+
+  if (bad == 0U) {
+    ++g_passed;
+    printf("[PASS] all %u vectors: add, sub and mul match the reference\n",
+           (unsigned)OW_FIELD_VECTOR_COUNT);
+  } else {
+    g_failures += (int)bad;
+    printf("[FAIL] %u field operation mismatches across %u vectors\n",
+           (unsigned)bad, (unsigned)OW_FIELD_VECTOR_COUNT);
+  }
+
+  if (noncanonical == 0U) {
+    ++g_passed;
+    printf("[PASS] every field result is fully reduced below p\n");
+  } else {
+    g_failures += (int)noncanonical;
+    printf("[FAIL] %u field results were not fully reduced\n",
+           (unsigned)noncanonical);
+  }
+
+  /* ---- identities -------------------------------------------------------- */
+
+  /* Zero and one are spelled out as byte patterns rather than computed, so a
+   * broken fe_0 or fe_1 cannot certify itself. */
+  {
+    static const uint8_t zero[32] = {0U};
+    static const uint8_t one[32] = {1U, 0U};
+
+    ow_ed_test_fe_zero(a);
+    ow_ed_test_fe_encode(buf, a);
+    check_bytes("field zero encodes as 32 zero bytes", buf, zero, 32);
+
+    ow_ed_test_fe_one(b);
+    ow_ed_test_fe_encode(buf, b);
+    check_bytes("field one encodes as 0x01 then zeros", buf, one, 32);
+  }
+
+  /* (P-1) + 1 == 0 exactly.  This is the case where reduction has to commit a
+   * subtraction that leaves no borrow at all.  Committing only when the
+   * subtraction borrowed, and committing unconditionally, both fail here in
+   * opposite directions. */
+  {
+    uint8_t p_minus_1[32];
+    static const uint8_t zero[32] = {0U};
+
+    memcpy(p_minus_1, field_const("p"), 32);
+    p_minus_1[0] = (uint8_t)(p_minus_1[0] - 1U); /* p - 1 == ...FFEC */
+
+    ow_ed_test_fe_decode(a, p_minus_1);
+    ow_ed_test_fe_one(b);
+    ow_ed_test_fe_add(got, a, b);
+    ow_ed_test_fe_encode(buf, got);
+    check_bytes("(P-1) + 1 reduces to exactly zero", buf, zero, 32);
+
+    ow_ed_test_fe_mul(got, a, b);
+    ow_ed_test_fe_encode(buf, got);
+    check_bytes("(P-1) * 1 is P-1", buf, p_minus_1, 32);
+
+    ow_ed_test_fe_sub(got, a, b);
+    ow_ed_test_fe_encode(buf, got);
+    check_bytes("(P-1) - 1 reduces to P-2", buf, field_const("p_minus_2"), 32);
+
+    ow_ed_test_fe_zero(b);
+    ow_ed_test_fe_sub(got, a, b);
+    ow_ed_test_fe_encode(buf, got);
+    check_bytes("(P-1) - 0 is P-1", buf, p_minus_1, 32);
+  }
+
+  /* 2^256 == 38 mod p, which is why an overflowing product folds its carry in
+   * scaled by 38.  2^128 * 2^128 is 2^256 exactly, so this is the one product
+   * whose limbs span the whole 512-bit accumulator and force both the
+   * high-limb carry and the fold.
+   *
+   * This states the fact; it does not substitute for the product vectors,
+   * because a fold that adds a flat 38 still satisfies it. */
+  {
+    static const uint8_t thirty_eight[32] = {38U, 0U};
+    static const uint8_t two_pow_128[32] = {
+        0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U,
+        1U};
+    ow_ed_test_fe_decode(a, two_pow_128);
+    ow_ed_test_fe_decode(b, two_pow_128);
+    ow_ed_test_fe_mul(got, a, b);
+    ow_ed_test_fe_encode(buf, got);
+    check_bytes("2^128 * 2^128 is 38, i.e. 2^256 == 38 mod p", buf,
+                thirty_eight, 32);
+  }
+
+  /* Reducing an already-canonical value must be a no-op, and reducing p must
+   * give exactly zero rather than p. */
+  {
+    static const uint8_t zero[32] = {0U};
+
+    ow_ed_test_fe_zero(a);
+    ow_ed_test_fe_reduce(got, a);
+    check_window("reducing zero leaves zero", ow_ed_test_fe_is_zero(got), true);
+
+    ow_ed_test_fe_decode(a, field_const("p"));
+    ow_ed_test_fe_reduce(got, a);
+    ow_ed_test_fe_encode(buf, got);
+    check_bytes("reducing p gives exactly zero, not p", buf, zero, 32);
+
+    ow_ed_test_fe_decode(a, field_const("p_minus_2"));
+    ow_ed_test_fe_reduce(got, a);
+    ow_ed_test_fe_encode(buf, got);
+    check_bytes("reducing p-2 leaves it unchanged", buf,
+                field_const("p_minus_2"), 32);
+  }
+
+  /* Every constant in the table must already be reduced.  A constant stored
+   * above p makes every operation on it arithmetically correct and every
+   * encoding of it wrong.
+   *
+   * p itself is the one exception: it is the modulus, so "below p" cannot apply
+   * to it.  It is excluded by name rather than by position so that inserting a
+   * constant does not silently change which one is skipped. */
+  {
+    uint32_t bad_const = 0U;
+    for (i = 0U; i < OW_FIELD_CONSTANT_COUNT; i++) {
+      if (strcmp(ow_field_constants[i].name, "p") == 0) {
+        continue;
+      }
+      if (!fe_bytes_below_p(ow_field_constants[i].value)) {
+        ++bad_const;
+        printf("       constant \"%s\" is not below p\n",
+               ow_field_constants[i].name);
+      }
+    }
+    check_window("every curve constant is stored reduced", bad_const == 0U,
+                 true);
+  }
+
+  /* fe_sq must agree with fe_mul(x, x) everywhere.  They are separate code
+   * paths, and a defect in one does not show up in the other's tests. */
+  {
+    uint32_t sq_bad = 0U;
+    for (i = 0U; i < OW_FIELD_VECTOR_COUNT; i++) {
+      const ow_field_vector *v = &ow_field_vectors[i];
+      ow_ed_test_fe_decode(a, v->a);
+      ow_ed_test_fe_sq(got, a);
+      ow_ed_test_fe_mul(want, a, a);
+      if (!ow_ed_test_fe_equal(got, want)) {
+        ++sq_bad;
+      }
+    }
+    check_window("fe_sq agrees with fe_mul(x, x) on every vector", sq_bad == 0U,
+                 true);
+  }
+
+  /* Inversion, stated as a^(p-2) * a == 1.
+   *
+   * This test exists because of a defect the rest of the file could not see.
+   * fe_pow walks its exponent most significant bit first, so the exponent has to
+   * be big-endian; the constant was stored little-endian, holding p rather than
+   * p-2.  Square-and-multiply then produced a perfectly well-formed field
+   * element for every input -- it was just a^(byte-reversed p-2).  Nothing above
+   * this point failed: the field vectors, the constant identities, and the RFC
+   * 8032 signatures all passed, because verification never inverts anything.
+   *
+   * That is the shape of the defect worth recording.  "It returns a plausible
+   * field element" is not the same as "it is the right one", and only an
+   * identity with an independently known answer distinguishes them. */
+  {
+    uint32_t inv_bad = 0U;
+    for (i = 0U; i < OW_FIELD_VECTOR_COUNT; i++) {
+      const ow_field_vector *v = &ow_field_vectors[i];
+      ow_ed_test_fe a, inv, prod;
+      ow_ed_test_fe_one(prod);
+      ow_ed_test_fe_decode(a, v->a);
+      if (ow_ed_test_fe_is_zero(a)) {
+        continue;
+      }
+      if (!ow_ed_test_fe_invert(inv, a)) {
+        ++inv_bad;
+        continue;
+      }
+      ow_ed_test_fe_mul(prod, a, inv);
+      if (!ow_ed_test_fe_equal(prod, k_field_one)) {
+        if (inv_bad < 5U) {
+          printf("       vector %u: a * a^-1 is not 1\n", (unsigned)i);
+        }
+        ++inv_bad;
+      }
+    }
+    check_window("a * a^-1 == 1 on every vector (a^(p-2) with a big-endian p-2)",
+                 inv_bad == 0U, true);
+  }
+
+  /* The exact inverse of 4, as bytes.  a^(p-2) * a == 1 already pins the
+   * exponent, but this states the value the reference produced, so a wrong
+   * exponent that happens to be self-consistent is still caught. */
+  {
+    static const uint8_t four[32] = {4U, 0U};
+    ow_ed_test_fe a, inv, prod;
+    ow_ed_test_fe_decode(a, four);
+    if (ow_ed_test_fe_invert(inv, a)) {
+      ow_ed_test_fe_mul(prod, a, inv);
+      check_window("4 * 4^-1 == 1", ow_ed_test_fe_equal(prod, k_field_one),
+                   true);
+      ow_ed_test_fe_encode(buf, inv);
+      check_bytes("4^-1 matches the reference", buf, field_const("inv4"), 32);
+    } else {
+      ++g_failures;
+      printf("[FAIL] 4 has no inverse\n");
+    }
+  }
+
+  /* Zero has no inverse, and the accessor says so rather than returning zero,
+   * which would make a ^-1 * 0 == 1 test pass by accident. */
+  {
+    ow_ed_test_fe zero, inv;
+    ow_ed_test_fe_zero(zero);
+    check_window("zero has no inverse", ow_ed_test_fe_invert(inv, zero) == false,
+                 true);
+  }
+
+  /* fe_pow with an all-zero exponent is 1 for any base, including zero.  A
+   * square-and-multiply that starts from the base instead of from 1 gets this
+   * wrong, and it is the cheapest way to see whether the loop is initialised. */
+  {
+    static const uint8_t zero_exp[32] = {0U};
+    ow_ed_test_fe a, r;
+    ow_ed_test_fe_decode(a, field_const("d"));
+    ow_ed_test_fe_pow(r, a, zero_exp);
+    check_window("d^0 is 1", ow_ed_test_fe_equal(r, k_field_one),
+                 true);
+  }
+
+  /* Exponent byte order, called out directly: raising 2 to the little-endian
+   * bytes of 4 and to the big-endian bytes of 4 must differ, and only the
+   * big-endian reading may give 16. */
+  {
+    static const uint8_t exp_be_4[32] = {
+        0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U,
+        0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 4U};
+    static const uint8_t exp_le_4[32] = {
+        4U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U,
+        0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U};
+    static const uint8_t sixteen[32] = {16U, 0U};
+    ow_ed_test_fe two, r;
+
+    ow_ed_test_fe_decode(two, field_const("two"));
+    ow_ed_test_fe_pow(r, two, exp_be_4);
+    ow_ed_test_fe_encode(buf, r);
+    check_bytes("2^4 with a big-endian exponent is 16", buf, sixteen, 32);
+
+    ow_ed_test_fe_pow(r, two, exp_le_4);
+    ow_ed_test_fe_encode(buf, r);
+    check_window("2^4 read little-endian is a different value",
+                 memcmp(buf, sixteen, 32) != 0, true);
+  }
+
+  printf("--- Ed25519 field arithmetic verified\n");
+}
+
+/* ---- scalar reduction mod L --------------------------------------------- */
+/*
+ * The load-bearing case is S == L exactly.  Reduction has to return zero for
+ * it, and the subtraction producing zero leaves no borrow -- so an
+ * implementation that commits its result only when the subtraction borrowed
+ * returns L instead of 0.  That defect is invisible from a signature test,
+ * because a wrong scalar reduction fails to verify either way.
+ */
+static void test_ed25519_scalars(void) {
+  uint8_t got[32];
+  uint8_t order_L[32];
+  uint8_t input[64];
+  uint32_t i;
+
+  printf("\n=== Ed25519 scalar reduction mod L ===\n");
+  printf("    %u reduction vectors, %u canonicality vectors\n",
+         (unsigned)OW_SCALAR_VECTOR_COUNT, (unsigned)OW_SCALAR_CANON_COUNT);
+
+  ow_ed_test_scalar_order_L(order_L);
+  check_bytes("the implementation's L matches the reference", order_L,
+              field_const("L"), 32);
+
+  for (i = 0U; i < OW_SCALAR_VECTOR_COUNT; i++) {
+    const ow_scalar_vector *v = &ow_scalar_vectors[i];
+    ow_ed_test_sc_reduce(got, v->in);
+    check_bytes_v("scalar reduction", i, got, v->want, 32);
+  }
+
+  /* L itself must reduce to zero.  Spelled out as well as tabulated, because it
+   * is the most load-bearing value in the file. */
+  memset(input, 0, sizeof(input));
+  memcpy(input, order_L, 32);
+  ow_ed_test_sc_reduce(got, input);
+  {
+    static const uint8_t zero[32] = {0U};
+    check_bytes("L reduces to exactly zero", got, zero, 32);
+  }
+
+  /* L + 1 reduces to 1, which also proves the comparison is against L and not
+   * against L - 1. */
+  memcpy(input, order_L, 32);
+  input[0] = (uint8_t)(input[0] + 1U);
+  ow_ed_test_sc_reduce(got, input);
+  {
+    static const uint8_t one[32] = {1U, 0U};
+    check_bytes("L + 1 reduces to exactly one", got, one, 32);
+  }
+
+  /* 2 * L reduces to zero, so reduction is right at more than one multiple. */
+  {
+    uint32_t carry = 0U;
+    uint32_t k;
+    uint8_t doubled[32];
+    static const uint8_t zero[32] = {0U};
+
+    for (k = 0U; k < 16U; k++) {
+      uint32_t sum = (uint32_t)order_L[2 * k] +
+                     ((uint32_t)order_L[2 * k + 1] << 8) + carry;
+      doubled[2 * k] = (uint8_t)(sum & 0xFFU);
+      doubled[2 * k + 1] = (uint8_t)((sum >> 8) & 0xFFU);
+      carry = sum >> 16;
+    }
+    check_window("doubling L fits in 32 bytes", carry == 0U, true);
+
+    memset(input, 0, sizeof(input));
+    memcpy(input, doubled, 32);
+    ow_ed_test_sc_reduce(got, input);
+    check_bytes("2 * L reduces to zero", got, zero, 32);
+  }
+
+  /* Canonicality boundaries.  Enforcing S < L is what stops the S-forgery lever:
+   * without it, a valid signature can be re-signed with S + L and still pass.
+   * The largest 32-byte scalar is far above L and must be rejected. */
+  {
+    uint8_t max_scalar[32];
+    uint8_t lm1[32];
+
+    memset(max_scalar, 0xFF, sizeof(max_scalar));
+    check_window("2^256-1 is non-canonical",
+                 ow_ed_test_sc_is_canonical(max_scalar), false);
+
+    memcpy(lm1, field_const("L"), 32);
+    lm1[0] = (uint8_t)(lm1[0] - 1U); /* L has a non-zero low byte */
+    check_window("L - 1 is canonical", ow_ed_test_sc_is_canonical(lm1), true);
+    check_window("L itself is non-canonical",
+                 ow_ed_test_sc_is_canonical(field_const("L")), false);
+  }
+
+  for (i = 0U; i < OW_SCALAR_CANON_COUNT; i++) {
+    const ow_scalar_canon_vector *v = &ow_scalar_canon_vectors[i];
+    bool canon = ow_ed_test_sc_is_canonical(v->s);
+    if (canon == (v->canonical != 0)) {
+      ++g_passed;
+      printf("[PASS] S canonicality vector %u\n", (unsigned)i);
+    } else {
+      ++g_failures;
+      printf("[FAIL] S canonicality vector %u: got %s, want %s\n",
+             (unsigned)i, canon ? "true" : "false",
+             (v->canonical != 0) ? "true" : "false");
+    }
+  }
+
+  printf("--- Ed25519 scalar reduction verified\n");
+}
+
+/* ---- point decoding, canonicality, group law ---------------------------- */
+/*
+ * Two properties are pinned here, and one absence is deliberate.
+ *
+ * Canonicality: a y at or above p is not a canonical encoding of any point, and
+ * two distinct byte strings naming the same point is exactly the malleability
+ * that makes naive signature comparison unsafe.  So y >= p must be refused, and
+ * x == 0 with the sign bit set must be refused, which RFC 8032 requires.  Both
+ * live in ge_frombytes and both are checked here.
+ *
+ * The small-order subgroup: all eight of its points are valid curve points, so
+ * decompression MUST accept them.  Rejecting them would not be a security
+ * property, it would be a deviation from the curve.  What makes them dangerous
+ * is the cofactorless verification equation -- a key drawn from that subgroup
+ * has no secret to protect.  The kernel never accepts a caller-supplied key;
+ * every key comes from the pinned trust store, so such a key cannot reach this
+ * code.  ow_ed25519.h states the limitation and says what must move first if a
+ * caller-supplied key ever becomes possible.  These tests assert the decode
+ * behaviour that actually exists rather than the reassuring behaviour that does
+ * not.
+ */
+
+static void test_ed25519_points(void) {
+  uint8_t identity[32];
+  uint8_t order_L[32];
+  uint8_t out[32];
+  uint8_t out2[32];
+  uint8_t scalar[32];
+  uint8_t public_key[32];
+  const uint8_t *base;
+  uint32_t i;
+
+  printf("\n=== Ed25519 point decoding and group law ===\n");
+
+  ow_ed_test_point_identity(identity);
+  ow_ed_test_scalar_order_L(order_L);
+  base = point_const("base");
+
+  /* Every torsion point decodes, round-trips, and has the order claimed.  The
+   * order claim is checked rather than trusted: [order]P must be the identity,
+   * which is what makes the label mean something. */
+  for (i = 0U; i < OW_TORSION_VECTOR_COUNT; i++) {
+    const ow_torsion_vector *v = &ow_torsion_vectors[i];
+    uint32_t k = v->order;
+    int bit = 0;
+
+    if (!ow_ed_test_point_decode(v->enc)) {
+      ++g_failures;
+      printf("[FAIL] small-order point %u must decode\n", (unsigned)i);
+      continue;
+    }
+    ++g_passed;
+    printf("[PASS] small-order point %u decodes, order %u\n", (unsigned)i,
+           (unsigned)v->order);
+
+    if (!ow_ed_test_point_encode(out, v->enc) ||
+        memcmp(out, v->enc, 32) != 0) {
+      ++g_failures;
+      printf("[FAIL] small-order point %u does not round-trip\n", (unsigned)i);
+    } else {
+      ++g_passed;
+      printf("[PASS] small-order point %u round-trips\n", (unsigned)i);
+    }
+
+    memset(scalar, 0, sizeof(scalar));
+    while (k > 0U) {
+      if ((k & 1U) != 0U) {
+        scalar[bit >> 3] |= (uint8_t)(1U << (bit & 7));
+      }
+      k >>= 1;
+      ++bit;
+    }
+    if (ow_ed_test_point_mul(out, scalar, v->enc) &&
+        memcmp(out, identity, 32) == 0) {
+      ++g_passed;
+      printf("[PASS] [%u]P is the identity\n", (unsigned)v->order);
+    } else {
+      ++g_failures;
+      printf("[FAIL] [%u]P is not the identity\n", (unsigned)v->order);
+    }
+  }
+
+  /* Non-canonical and off-curve encodings must be refused.  Each is a real byte
+   * string rather than corruption, so each exercises one specific rule. */
+  for (i = 0U; i < OW_MALFORMED_POINT_COUNT; i++) {
+    if (ow_ed_test_point_decode(ow_malformed_points[i])) {
+      ++g_failures;
+      printf("[FAIL] malformed point %u must be refused\n", (unsigned)i);
+    } else {
+      ++g_passed;
+      printf("[PASS] malformed point %u refused\n", (unsigned)i);
+    }
+  }
+
+  for (i = 0U; i < OW_POINT_IDENTITY_COUNT; i++) {
+    const ow_point_identity *v = &ow_point_identities[i];
+    if (!ow_ed_test_point_add(out, v->a, v->b) ||
+        memcmp(out, v->want, 32) != 0) {
+      ++g_failures;
+      printf("[FAIL] point identity %u: add mismatch\n", (unsigned)i);
+    } else {
+      ++g_passed;
+      printf("[PASS] point identity %u\n", (unsigned)i);
+    }
+  }
+
+  /* [L]B == identity.  This is the property that makes every signature equation
+   * in the file mean what it claims: S is reduced mod L precisely so that [S]B
+   * is well defined on the prime-order subgroup.  If L were wrong, or if scalar
+   * multiplication dropped or reordered a bit, this is the assertion that
+   * fails. */
+  if (ow_ed_test_point_mul_base(out, order_L) &&
+      memcmp(out, identity, 32) == 0) {
+    ++g_passed;
+    printf("[PASS] [L]B is the identity\n");
+  } else {
+    ++g_failures;
+    printf("[FAIL] [L]B is not the identity\n");
+  }
+
+  /* [L]A for a real public key is also the identity: L is the order of the whole
+   * group here, and A need not be the base point. */
+  memcpy(public_key,
+         "\xd7\x5a\x98\x01\x82\xb1\x0a\xb7\xd5\x4b\xfe\xd3\xc9\x64\x07\x3a"
+         "\x0e\xe1\x72\xf3\xda\xa6\x23\x25\xaf\x02\x1a\x68\xf7\x07\x51\x1a",
+         32);
+  if (ow_ed_test_point_mul(out, order_L, public_key) &&
+      memcmp(out, identity, 32) == 0) {
+    ++g_passed;
+    printf("[PASS] [L]A is the identity for a real public key\n");
+  } else {
+    ++g_failures;
+    printf("[FAIL] [L]A is not the identity for a real public key\n");
+  }
+
+  /* Small scalars must not be special-cased.  [1]B is B, [0]B is the identity,
+   * [2]B is B doubled -- bracketing the range from nothing to the whole group. */
+  memset(scalar, 0, sizeof(scalar));
+  scalar[0] = 1U;
+  if (ow_ed_test_point_mul_base(out, scalar) && memcmp(out, base, 32) == 0) {
+    ++g_passed;
+    printf("[PASS] [1]B is B\n");
+  } else {
+    ++g_failures;
+    printf("[FAIL] [1]B is not B\n");
+  }
+
+  memset(scalar, 0, sizeof(scalar));
+  if (ow_ed_test_point_mul_base(out2, scalar) &&
+      memcmp(out2, identity, 32) == 0) {
+    ++g_passed;
+    printf("[PASS] [0]B is the identity\n");
+  } else {
+    ++g_failures;
+    printf("[FAIL] [0]B is not the identity\n");
+  }
+
+  memset(scalar, 0, sizeof(scalar));
+  scalar[0] = 2U;
+  if (ow_ed_test_point_mul_base(out2, scalar) &&
+      ow_ed_test_point_double(out, base) && memcmp(out2, out, 32) == 0) {
+    ++g_passed;
+    printf("[PASS] [2]B equals B doubled\n");
+  } else {
+    ++g_failures;
+    printf("[FAIL] [2]B does not equal B doubled\n");
+  }
+
+  /* Equality must be projective, not structural.  Two routes to the same point
+   * need not produce the same coordinates, so a comparison of the raw tuples
+   * would report a correct point as different.  Both routes here are computed
+   * independently, and they must agree as encodings and as points. */
+  memset(scalar, 0, sizeof(scalar));
+  scalar[0] = 2U;
+  if (ow_ed_test_point_mul_base(out, scalar) &&
+      ow_ed_test_point_double(out2, base) &&
+      memcmp(out, out2, 32) == 0 && ow_ed_test_point_equal(out, out2)) {
+    ++g_passed;
+    printf("[PASS] 2B reached two ways compares equal\n");
+  } else {
+    ++g_failures;
+    printf("[FAIL] 2B reached two ways does not compare equal\n");
+  }
+
+  printf("--- Ed25519 point decoding and group law verified\n");
+}
+
+/* ---- derived constants -------------------------------------------------- */
+/*
+ * lib/ow_ed25519.c derives its constants numerically and then freezes them.  A
+ * frozen constant still has to be the right constant, and these identities say
+ * so without quoting a second copy of the number:
+ *
+ *   d * 121666 == -121665                pins the curve parameter
+ *   d2 == d + d                          pins what the addition formula uses
+ *   sqrt(-1)^2 == p - 1                  pins the square root
+ *   -bx^2 + by^2 == 1 + d*bx^2*by^2      pins the base point
+ *   bt == bx * by                        pins the base point's T
+ *   8 * ((p-5)/8) == p - 5               pins the square-root exponent
+ *
+ * sqrt(-1) is the one that bit during development: a single mistyped limb
+ * (0x0A0B for 0xA0B0) leaves a plausible constant in the source, and the
+ * resulting failure looks like a broken curve rather than a transcription slip.
+ */
+static void test_ed25519_constants(void) {
+  ow_ed_test_fe bx, by, bt, dval, scratch;
+  uint8_t buf[32];
+  const uint8_t *p = field_const("p");
+  const uint8_t *base = point_const("base");
+
+  printf("\n=== Ed25519 derived constants ===\n");
+
+  /* p = 2^255 - 19, so every limb is at its maximum except limb 0 (0xFFED) and
+   * the top limb (0x7FFF).  Checking the shape is enough to catch a wrong p,
+   * because p is what makes 2^256 == 38. */
+  {
+    uint32_t k;
+    uint32_t bad_limb = 0U;
+    for (k = 1U; k < 15U; k++) {
+      if (p[k * 2] != 0xFFU || p[k * 2 + 1] != 0xFFU) {
+        ++bad_limb;
+      }
+    }
+    check_window("p has the 2^255 - 19 shape in limbs 1..14", bad_limb == 0U,
+                 true);
+    check_window("p limb 0 is 0xffed", p[0] == 0xEDU && p[1] == 0xFFU, true);
+    check_window("p top limb is 0x7fff", p[30] == 0xFFU && p[31] == 0x7FU, true);
+  }
+
+  /* p - 2 is what the inversion in point encoding uses, and p - 1 is -1.  The
+   * accessor computes p - 2 by subtraction rather than transcribing it, so
+   * agreeing with the reference means both routes agree. */
+  ow_ed_test_field_p_minus_2(buf);
+  check_bytes("the implementation's p-2 matches the reference", buf,
+              field_const("p_minus_2"), 32);
+
+  /* d * 121666 + 121665 == 0 pins the ratio rather than either number alone. */
+  ow_ed_test_fe_decode(dval, field_const("d"));
+  ow_ed_test_fe_decode(scratch, field_const("d_denom"));
+  ow_ed_test_fe_mul(scratch, dval, scratch);
+  ow_ed_test_fe_decode(by, field_const("d_neg_num"));
+  ow_ed_test_fe_add(scratch, scratch, by);
+  check_window("d * 121666 + 121665 == 0", ow_ed_test_fe_is_zero(scratch), true);
+
+  /* d2 == d + d.  The addition formula multiplies by 2d, and a wrong d2 produces
+   * sums that still decode as plausible points, so nothing above would notice. */
+  ow_ed_test_fe_add(scratch, dval, dval);
+  ow_ed_test_fe_encode(buf, scratch);
+  check_bytes("d2 == d + d", buf, field_const("d2"), 32);
+
+  /* sqrt(-1)^2 == p - 1.  This is the identity that catches the mistyped limb
+   * which cost the most time during development. */
+  ow_ed_test_fe_decode(scratch, field_const("sqrtm1"));
+  ow_ed_test_fe_sq(scratch, scratch);
+  ow_ed_test_fe_encode(buf, scratch);
+  {
+    uint8_t p_minus_1[32];
+    memcpy(p_minus_1, p, 32);
+    p_minus_1[0] = (uint8_t)(p_minus_1[0] - 1U);
+    check_bytes("sqrt(-1)^2 == p - 1", buf, p_minus_1, 32);
+  }
+
+  /* 8 * ((p-5)/8) == p - 5, the exponent square-root recovery uses. */
+  ow_ed_test_fe_decode(scratch, field_const("exp_sqrt_m5"));
+  ow_ed_test_fe_add(by, scratch, scratch);   /* 2x */
+  ow_ed_test_fe_add(bt, by, by);             /* 4x */
+  ow_ed_test_fe_add(scratch, bt, bt);        /* 8x */
+  ow_ed_test_fe_encode(buf, scratch);
+  check_bytes("8 * ((p-5)/8) == p - 5", buf, field_const("p_minus_5"), 32);
+
+  /* The base point satisfies -x^2 + y^2 == 1 + d*x^2*y^2, and T == X*Y.  Both
+   * are computed from the stored constants, so a wrong bx, by or bt is caught
+   * here even though it would still decode as a point. */
+  ow_ed_test_fe_decode(bx, field_const("bx"));
+  ow_ed_test_fe_decode(by, field_const("by"));
+  ow_ed_test_fe_decode(bt, field_const("bt"));
+
+  /* -x^2 + y^2 == 1 + d*x^2*y^2, rearranged so both sides can be built from
+   * bx and by without a division.  On the curve this must hold exactly; a wrong
+   * bx or by violates it even though the pair still decompresses. */
+  {
+    ow_ed_test_fe lhs, rhs, one;
+
+    ow_ed_test_fe_sq(lhs, by);             /* y^2 */
+    ow_ed_test_fe_sq(rhs, bx);             /* x^2 */
+    ow_ed_test_fe_sub(lhs, lhs, rhs);      /* y^2 - x^2 */
+    ow_ed_test_fe_one(one);
+    ow_ed_test_fe_sub(lhs, lhs, one);      /* y^2 - x^2 - 1 */
+
+    ow_ed_test_fe_sq(rhs, bx);             /* x^2 */
+    ow_ed_test_fe_sq(scratch, by);         /* y^2 */
+    ow_ed_test_fe_mul(rhs, rhs, scratch);  /* x^2 * y^2 */
+    ow_ed_test_fe_mul(rhs, rhs, dval);     /* d * x^2 * y^2 */
+
+    check_window("the base point satisfies -x^2 + y^2 == 1 + d*x^2*y^2",
+                 ow_ed_test_fe_equal(lhs, rhs), true);
+  }
+
+  ow_ed_test_fe_mul(scratch, bx, by);
+  ow_ed_test_fe_encode(buf, scratch);
+  check_bytes("bt == bx * by", buf, field_const("bt"), 32);
+
+  /* The base point must decompress and round-trip, which ties the constants to
+   * the decompression path: if d, sqrt(-1) or the exponent were wrong, the
+   * encoding would not survive a decode. */
+  if (ow_ed_test_point_decode(base)) {
+    ++g_passed;
+    printf("[PASS] the base point decompresses\n");
+  } else {
+    ++g_failures;
+    printf("[FAIL] the base point does not decompress\n");
+  }
+  if (ow_ed_test_point_encode(buf, base) && memcmp(buf, base, 32) == 0) {
+    ++g_passed;
+    printf("[PASS] the base point round-trips through its encoding\n");
+  } else {
+    ++g_failures;
+    printf("[FAIL] the base point does not round-trip\n");
+  }
+
+  printf("--- Ed25519 derived constants verified\n");
+}
+
+/* ---- signature verification ---------------------------------------------- */
+/*
+ * The top layer, and the only one the kernel itself uses.  Everything above
+ * exists to explain a failure here.
+ *
+ * The vector set mixes RFC 8032 known answers, round trips across message
+ * lengths that straddle the SHA-512 block boundary, and negatives that each
+ * probe one refusal the verifier is supposed to make: an altered message, the
+ * wrong key, an altered R or S, a non-reduced S including exactly L, a
+ * non-canonical or off-curve R, and a public key that is not a canonical point.
+ *
+ * The identity and order-2 public keys are negatives for a reason worth
+ * stating plainly: a signature that verifies under such a key is not a defect in
+ * the verifier, it is the cofactorless equation doing what cofactorless means.
+ * Because the kernel never accepts a caller-supplied key, those keys cannot be
+ * presented to it.  If a later stage introduces caller-supplied keys, these
+ * expectations must be revisited before that code is written.
+ */
+static void test_ed25519_verify(void) {
+  uint32_t i;
+  uint32_t positive = 0U;
+  uint32_t negative = 0U;
+
+  printf("\n=== Ed25519 signature verification (RFC 8032) ===\n");
+  printf("    %u signature vectors\n", (unsigned)OW_ED25519_VECTOR_COUNT);
+
+  for (i = 0U; i < OW_ED25519_VECTOR_COUNT; i++) {
+    const ow_ed25519_vector *v = &ow_ed25519_vectors[i];
+    bool got = ow_crypto_ed25519_verify(v->pub, v->sig, v->msg, v->msg_len);
+    if (got == (v->expect != 0)) {
+      ++g_passed;
+      if (v->expect) {
+        ++positive;
+      } else {
+        ++negative;
+      }
+    } else {
+      ++g_failures;
+      printf("[FAIL] signature vector %u: expected %s\n", (unsigned)i,
+             v->expect ? "accept" : "reject");
+    }
+  }
+
+  printf("[PASS] %u vectors accepted, %u vectors rejected\n", positive,
+         negative);
+  ++g_passed;
+
+  /* NULL handling is part of the contract: a zero-length message must not need
+   * a special case at the call site, and a NULL must be refused rather than
+   * dereferenced. */
+  {
+    static const uint8_t pub[32] = {
+        0xD7U, 0x5AU, 0x98U, 0x01U, 0x82U, 0xB1U, 0x0AU, 0xB7U,
+        0xD5U, 0x4BU, 0xFEU, 0xD3U, 0xC9U, 0x64U, 0x07U, 0x3AU,
+        0x0EU, 0xE1U, 0x72U, 0xF3U, 0xDAU, 0xA6U, 0x23U, 0x25U,
+        0xAFU, 0x02U, 0x1AU, 0x68U, 0xF7U, 0x07U, 0x51U, 0x1AU};
+    static const uint8_t sig[64] = {
+        0x90U, 0x5FU, 0x0CU, 0x6EU, 0x66U, 0x58U, 0x7CU, 0xD6U,
+        0x60U, 0xDEU, 0x04U, 0xCBU, 0xF8U, 0x89U, 0x33U, 0x94U,
+        0xBCU, 0x69U, 0x35U, 0x74U, 0x67U, 0x5BU, 0xE0U, 0x5AU,
+        0xC8U, 0x1FU, 0x64U, 0xF3U, 0x1FU, 0x46U, 0x1CU, 0x22U,
+        0x77U, 0x07U, 0x77U, 0x74U, 0x54U, 0x76U, 0x0AU, 0xC1U,
+        0xD6U, 0x21U, 0x77U, 0x66U, 0x8CU, 0x20U, 0x97U, 0x63U,
+        0x96U, 0x0FU, 0xE1U, 0xF8U, 0x33U, 0xA1U, 0x4DU, 0xAEU};
+
+    check_window("a NULL message with non-zero length is refused",
+                 ow_crypto_ed25519_verify(pub, sig, NULL, 8U), false);
+    check_window("a NULL message with zero length is refused, not a crash",
+                 ow_crypto_ed25519_verify(pub, sig, NULL, 0U), false);
+    check_window("a NULL public key is refused",
+                 ow_crypto_ed25519_verify(NULL, sig, NULL, 0U), false);
+    check_window("a NULL signature is refused",
+                 ow_crypto_ed25519_verify(pub, NULL, NULL, 0U), false);
+  }
+
+  printf("--- Ed25519 signature verification verified\n");
+}
+
+/* ------------------------------------------------------------------------- */
+/* Process-entry argc/argv block layout                                       */
+/* ------------------------------------------------------------------------- */
+/* The launcher lays the entry program's arguments into the top user stack page
+ * and (see test_entry_arg_regs) points the Microsoft x64 argument registers at
+ * them.  OwPsBuildArgv() is the pure half -- the layout -- so it is exercised
+ * here against a plain byte buffer: page bounds, the NULL terminator,
+ * per-argument length, alignment, and every refusal path.  A launcher bug in
+ * this arithmetic would otherwise surface only as a program reading a wild
+ * argv[0] at CPL3, which is very hard to attribute. */
+static uint64_t htest_le64(const uint8_t* p) {
+  uint64_t v = 0u;
+  unsigned i;
+  for (i = 0u; i < 8u; i++) v |= (uint64_t)p[i] << (8u * i);
+  return v;
+}
+
+static bool htest_streq_at(const uint8_t* page, uint32_t off, const char* want) {
+  uint32_t i = 0u;
+  while (want[i] != '\0') {
+    if (page[off + i] != (uint8_t)want[i]) return false;
+    i++;
+  }
+  return page[off + i] == 0u;
+}
+
+static void test_argv_layout(void) {
+  static uint8_t page[OW_PAGE_SIZE];
+  static char    big[OW_PAGE_SIZE + 1u];
+  const uint64_t top  = 0x4200000ULL; /* page aligned; models OW_USER_WINDOW_END */
+  const uint64_t base = top - (uint64_t)OW_PAGE_SIZE;
+  uint64_t argv_va = 0u;
+  uint32_t off;
+  unsigned i;
+
+  printf("\n=== process-entry argc/argv layout ===\n");
+
+  /* argc == 0: argv is a single NULL slot. */
+  argv_va = 0xDEADBEEFULL;
+  memset(page, 0xAA, sizeof(page));
+  check_window("OwPsBuildArgv(argc=0) is accepted",
+               ow_status_success(OwPsBuildArgv(page, top, 0, NULL, &argv_va)), true);
+  check_window("OwPsBuildArgv(argc=0) stays inside the page",
+               argv_va >= base && argv_va + 8u <= top, true);
+  check_window("OwPsBuildArgv(argc=0) writes argv[0] == NULL",
+               htest_le64(page + (uint32_t)(argv_va - base)) == 0u, true);
+
+  /* argc == 1. */
+  {
+    const char* a[1];
+    a[0] = "owsh.owx";
+    memset(page, 0, sizeof(page));
+    check_window("OwPsBuildArgv(argc=1) is accepted",
+                 ow_status_success(OwPsBuildArgv(page, top, 1, a, &argv_va)), true);
+    off = (uint32_t)(argv_va - base);
+    check_window("argc=1 argv[1] == NULL",
+                 htest_le64(page + off + 8u) == 0u, true);
+    check_window("argc=1 argv[0] points at its own string",
+                 htest_streq_at(page,
+                                (uint32_t)(htest_le64(page + off) - base),
+                                "owsh.owx"), true);
+  }
+
+  /* argc == 3, argument order preserved. */
+  {
+    const char* a[3];
+    a[0] = "startwm";
+    a[1] = "--safe";
+    a[2] = "--res";
+    memset(page, 0, sizeof(page));
+    check_window("OwPsBuildArgv(argc=3) is accepted",
+                 ow_status_success(OwPsBuildArgv(page, top, 3, a, &argv_va)), true);
+    off = (uint32_t)(argv_va - base);
+    check_window("argc=3 argv[0]",
+                 htest_streq_at(page,
+                                (uint32_t)(htest_le64(page + off) - base),
+                                "startwm"), true);
+    check_window("argc=3 argv[1]",
+                 htest_streq_at(page,
+                                (uint32_t)(htest_le64(page + off + 8u) - base),
+                                "--safe"), true);
+    check_window("argc=3 argv[2]",
+                 htest_streq_at(page,
+                                (uint32_t)(htest_le64(page + off + 16u) - base),
+                                "--res"), true);
+    check_window("argc=3 argv[3] == NULL",
+                 htest_le64(page + off + 24u) == 0u, true);
+  }
+
+  /* Refusals: every one must be a clean error, never a partial layout. */
+  check_window("a NULL page is refused",
+               ow_status_error(OwPsBuildArgv(NULL, top, 0, NULL, &argv_va)), true);
+  check_window("a NULL out-pointer is refused",
+               ow_status_error(OwPsBuildArgv(page, top, 0, NULL, NULL)), true);
+  check_window("a non-page-aligned page_top_va is refused",
+               ow_status_error(OwPsBuildArgv(page, top + 8u, 0, NULL, &argv_va)), true);
+  check_window("argc above OW_ARGV_MAX is refused",
+               ow_status_error(OwPsBuildArgv(page, top, (int)OW_ARGV_MAX + 1,
+                                             NULL, &argv_va)), true);
+  check_window("a negative argc is refused",
+               ow_status_error(OwPsBuildArgv(page, top, -1, NULL, &argv_va)), true);
+  {
+    const char* a[1];
+    a[0] = NULL;
+    check_window("a NULL argv entry is refused",
+                 ow_status_error(OwPsBuildArgv(page, top, 1, a, &argv_va)), true);
+  }
+  check_window("argv == NULL with argc > 0 is refused",
+               ow_status_error(OwPsBuildArgv(page, top, 1, NULL, &argv_va)), true);
+
+  /* A string with no NUL inside the page is refused, not read past its end. */
+  for (i = 0u; i < (unsigned)OW_PAGE_SIZE; i++) big[i] = 'A';
+  big[OW_PAGE_SIZE] = '\0';
+  {
+    const char* a[1];
+    a[0] = big;
+    check_window("an argument longer than the page is refused",
+                 ow_status_error(OwPsBuildArgv(page, top, 1, a, &argv_va)), true);
+  }
+
+  /* More bytes than a page cannot fit: refused, never truncated. */
+  {
+    static char chunk[100];
+    const char* a[OW_ARGV_MAX];
+    memset(chunk, 'x', sizeof(chunk));
+    chunk[sizeof(chunk) - 1u] = '\0';
+    for (i = 0u; i < (unsigned)OW_ARGV_MAX; i++) a[i] = chunk;
+    check_window("a block larger than one page is refused",
+                 ow_status_error(OwPsBuildArgv(page, top, (int)OW_ARGV_MAX, a,
+                                               &argv_va)), true);
+  }
+
+  printf("--- argv layout verified\n");
+}
+
+/* ------------------------------------------------------------------------- */
+/* Process-entry argument registers                                            */
+/* ------------------------------------------------------------------------- */
+/* The argv-layout suite above proves the block is built correctly, but not that
+ * the launcher points the entry at it.  That delivery step is where a real bug
+ * hid: the launcher stamped the x86-64 SysV register file (argc in RDI, argv in
+ * RSI) while every MinGW-built .owx reads the Microsoft x64 registers (argc in
+ * RCX, argv in RDX, envp in R8), so an emulated boot reported argc=0 for a
+ * four-argument vector.  OwPsStampEntryArgs is the exact function the launcher
+ * calls; this test pins the slot-by-slot mapping so the regression cannot recur
+ * silently.  (The indices are not arbitrary: ps/switch.S restores Gpr[1] to RCX,
+ * Gpr[2] to RDX, Gpr[5] to R8.) */
+static void test_entry_arg_regs(void) {
+  OW_THREAD_CONTEXT ctx;
+  const uint64_t sentinel = 0xDEADBEEFDEADBEEFULL;
+  const uint64_t argv_va  = 0x7FFF00001234ULL;
+  uint32_t k;
+
+  printf("\n=== Process-entry argument registers ===\n");
+
+  for (k = 0u; k < (uint32_t)OW_THREAD_FRAME_GPS; k++) ctx.Gpr[k] = sentinel;
+
+  OwPsStampEntryArgs(&ctx, 4, argv_va);
+
+  check_window("Gpr[1] (RCX) holds argc", ctx.Gpr[1] == 4u, true);
+  check_window("Gpr[2] (RDX) holds the argv VA", ctx.Gpr[2] == argv_va, true);
+  check_window("Gpr[5] (R8) holds envp == 0", ctx.Gpr[5] == 0u, true);
+
+  /* The SysV argument slots must be left untouched: stamping RDI/RSI is the
+   * exact bug being guarded against, and a nonzero RDI here would mean the
+   * launcher regressed to the convention a MinGW image never reads. */
+  check_window("Gpr[4] (RDI) is left untouched, not argc", ctx.Gpr[4] == sentinel, true);
+  check_window("Gpr[3] (RSI) is left untouched, not argv", ctx.Gpr[3] == sentinel, true);
+  check_window("Gpr[0] (RAX) is left untouched", ctx.Gpr[0] == sentinel, true);
+
+  /* argc = 0 is the documented empty-vector state: RCX = 0, still RDX = argv_va
+   * (the builder emits a lone NULL slot) and R8 = 0. */
+  for (k = 0u; k < (uint32_t)OW_THREAD_FRAME_GPS; k++) ctx.Gpr[k] = sentinel;
+  OwPsStampEntryArgs(&ctx, 0, argv_va);
+  check_window("argc=0 stamps Gpr[1] (RCX) == 0", ctx.Gpr[1] == 0u, true);
+  check_window("argc=0 still stamps Gpr[2] (RDX) == argv VA", ctx.Gpr[2] == argv_va, true);
+  check_window("argc=0 still stamps Gpr[5] (R8) == 0", ctx.Gpr[5] == 0u, true);
+
+  /* A large positive argc must land zero-extended in RCX, not sign/partial. */
+  for (k = 0u; k < (uint32_t)OW_THREAD_FRAME_GPS; k++) ctx.Gpr[k] = sentinel;
+  OwPsStampEntryArgs(&ctx, 0x7FFF1234, argv_va);
+  check_window("a large argc is zero-extended into Gpr[1]",
+               ctx.Gpr[1] == 0x7FFF1234ULL, true);
+
+  /* Defensive: a NULL context is a no-op, not a fault. */
+  OwPsStampEntryArgs(NULL, 4, argv_va);
+  check_window("a NULL context is accepted without crashing", true, true);
+
+  printf("--- entry argument registers verified\n");
+}
+
+/* -------------------------------------------------------------------- */
+/* kconfctl config core (regression)                                     */
+/* -------------------------------------------------------------------- */
+/* kconfctl is the first `.owx` repointed at a real entry whose decision
+ * logic was split into an I/O-free header, so the harness can drive the same
+ * functions the CLI runs against the same kconf64 the CLI statically links.
+ * The cases pin three things at once: the verb classifier, the query/apply
+ * rules (including the key/value length bound that kconf_set_* would otherwise
+ * enforce by silent truncation), and the base-10 parser.  Persistence is
+ * deliberately not claimed, so every set below is verified by a read-back
+ * rather than by the setter's own return value.
+ *
+ * The registry is process-global, so the read-only cases run first and the
+ * cases that add keys assert the exact count transitions (4 -> 5 -> 6). */
+static bool kconfctl_core_int_is(const char *key, int64_t want) {
+  int64_t v = 0;
+  return kconfctl_query_int(key, &v) && v == want;
+}
+
+static void test_kconfctl_core(void) {
+  char longkey[(size_t)KCONF_MAX_KEY_LEN + 1u];
+  char longval[KCONF_MAX_VAL_LEN + 1u];
+  size_t i;
+
+  printf("\n=== kconfctl config core ===\n");
+
+  kconf64_init();
+  check_window("registry seeds with 4 default keys",
+               kconf64_count() == 4u, true);
+
+  /* Verb classification.  NONE (no argument) and UNKNOWN (a bad verb) are kept
+   * distinct so the CLI can print usage for one and name the other. */
+  check_window("classify(NULL) is NONE",
+               kconfctl_classify((const char *)0) == KCONFCTL_CMD_NONE, true);
+  check_window("classify(\"help\") is HELP",
+               kconfctl_classify("help") == KCONFCTL_CMD_HELP, true);
+  check_window("classify(\"get\") is GET",
+               kconfctl_classify("get") == KCONFCTL_CMD_GET, true);
+  check_window("classify(\"getint\") is GETINT",
+               kconfctl_classify("getint") == KCONFCTL_CMD_GETINT, true);
+  check_window("classify(\"set\") is SET",
+               kconfctl_classify("set") == KCONFCTL_CMD_SET, true);
+  check_window("classify(\"setint\") is SETINT",
+               kconfctl_classify("setint") == KCONFCTL_CMD_SETINT, true);
+  check_window("classify(\"count\") is COUNT",
+               kconfctl_classify("count") == KCONFCTL_CMD_COUNT, true);
+  check_window("classify(\"frobnicate\") is UNKNOWN",
+               kconfctl_classify("frobnicate") == KCONFCTL_CMD_UNKNOWN, true);
+
+  /* Built-in string defaults resolve; a missing key and a non-string node both
+   * read back as absent. */
+  check_window("default kernel/panic/action == \"banhammer\"",
+               kconfctl_str_eq(kconfctl_query_string("kernel/panic/action"),
+                               "banhammer"), true);
+  check_window("default ui/wm/theme == \"classic_azure\"",
+               kconfctl_str_eq(kconfctl_query_string("ui/wm/theme"),
+                               "classic_azure"), true);
+  check_window("missing string key reads back NULL",
+               kconfctl_query_string("no/such/key") == (const char *)0, true);
+  check_window("integer node is not a string",
+               kconfctl_query_string("drivers/sio/baud_rate") ==
+                   (const char *)0, true);
+  check_window("NULL key reads back NULL",
+               kconfctl_query_string((const char *)0) == (const char *)0, true);
+
+  /* Built-in integer defaults, plus the two absent cases: a missing key and a
+   * node of the wrong type. */
+  check_window("default drivers/sio/baud_rate == 115200",
+               kconfctl_core_int_is("drivers/sio/baud_rate", 115200), true);
+  check_window("default kernel/memory/pool_size == 67108864",
+               kconfctl_core_int_is("kernel/memory/pool_size", 67108864), true);
+  check_window("missing integer key is absent",
+               kconfctl_core_int_is("no/such/key", 0), false);
+  check_window("string node is not an integer",
+               kconfctl_core_int_is("kernel/panic/action", 0), false);
+  check_window("NULL integer key is absent",
+               kconfctl_core_int_is((const char *)0, 0), false);
+
+  /* Overwriting an existing key keeps the count; adding a new key grows it. */
+  check_window("set an existing key returns true",
+               kconfctl_apply_string("ui/wm/theme", "custom_theme"), true);
+  check_window("overwritten value reads back",
+               kconfctl_str_eq(kconfctl_query_string("ui/wm/theme"),
+                               "custom_theme"), true);
+  check_window("overwrite did not change the count",
+               kconf64_count() == 4u, true);
+
+  check_window("set a new string key returns true",
+               kconfctl_apply_string("user/test/name", "abc"), true);
+  check_window("new string key reads back",
+               kconfctl_str_eq(kconfctl_query_string("user/test/name"), "abc"),
+               true);
+  check_window("new string key grew the count to 5",
+               kconf64_count() == 5u, true);
+
+  check_window("setint a new key returns true",
+               kconfctl_apply_int("user/test/count", 42), true);
+  check_window("setint reads back through the query helper",
+               kconfctl_core_int_is("user/test/count", 42), true);
+  check_window("setint added a sixth key",
+               kconf64_count() == 6u, true);
+
+  /* A set of the wrong type replaces the node's type; the old accessor then
+   * reports it absent.  This pins that kconf_set_str/int overwrite in place
+   * rather than shadow a key with a second node. */
+  check_window("setint onto an existing string key returns true",
+               kconfctl_apply_int("user/test/name", 7), true);
+  check_window("the old string accessor now reports absent",
+               kconfctl_query_string("user/test/name") == (const char *)0, true);
+  check_window("the integer accessor reads the new value",
+               kconfctl_core_int_is("user/test/name", 7), true);
+  check_window("the type swap did not change the count",
+               kconf64_count() == 6u, true);
+
+  /* Length bounds.  The engine truncates silently past the fixed width, so the
+   * core rejects at exactly KCONF_MAX_*_LEN where that truncation would begin. */
+  for (i = 0u; i < (size_t)KCONF_MAX_KEY_LEN; ++i) longkey[i] = 'k';
+  longkey[KCONF_MAX_KEY_LEN] = '\0';
+  check_window("a 128-char key is rejected",
+               kconfctl_apply_string(longkey, "v"), false);
+
+  for (i = 0u; i < (size_t)KCONF_MAX_VAL_LEN; ++i) longval[i] = 'v';
+  longval[KCONF_MAX_VAL_LEN] = '\0';
+  check_window("a 128-char value is rejected",
+               kconfctl_apply_string("user/test/val", longval), false);
+  check_window("a 127-char value is accepted",
+               kconfctl_apply_string("user/test/val", longval + 1), true);
+
+  check_window("apply_string(NULL key) is rejected",
+               kconfctl_apply_string((const char *)0, "v"), false);
+  check_window("apply_string(NULL value) is rejected",
+               kconfctl_apply_string("user/test/x", (const char *)0), false);
+  check_window("apply_int(NULL key) is rejected",
+               kconfctl_apply_int((const char *)0, 1), false);
+
+  /* Strict base-10 signed 64-bit parser: accepted forms first, then every shape
+   * of malformed input, then the two overflow boundaries. */
+  {
+    int64_t v = 0;
+    check_window("parse \"0\"", kconfctl_parse_i64("0", &v) && v == 0, true);
+    check_window("parse \"42\"", kconfctl_parse_i64("42", &v) && v == 42, true);
+    check_window("parse \"-7\"", kconfctl_parse_i64("-7", &v) && v == -7, true);
+    check_window("parse \"+5\"", kconfctl_parse_i64("+5", &v) && v == 5, true);
+    check_window("parse INT64_MAX",
+                 kconfctl_parse_i64("9223372036854775807", &v) &&
+                     v == INT64_MAX, true);
+    check_window("parse INT64_MIN",
+                 kconfctl_parse_i64("-9223372036854775808", &v) &&
+                     v == INT64_MIN, true);
+
+    check_window("parse \"\" fails", kconfctl_parse_i64("", &v), false);
+    check_window("parse \"+\" fails", kconfctl_parse_i64("+", &v), false);
+    check_window("parse \"-\" fails", kconfctl_parse_i64("-", &v), false);
+    check_window("parse \"12a\" fails", kconfctl_parse_i64("12a", &v), false);
+    check_window("parse \"1.5\" fails", kconfctl_parse_i64("1.5", &v), false);
+    check_window("parse \" 12\" fails", kconfctl_parse_i64(" 12", &v), false);
+    check_window("parse overflow fails",
+                 kconfctl_parse_i64("9223372036854775808", &v), false);
+    check_window("parse underflow fails",
+                 kconfctl_parse_i64("-9223372036854775809", &v), false);
+    check_window("parse(NULL) fails",
+                 kconfctl_parse_i64((const char *)0, &v), false);
+    check_window("parse with NULL out fails",
+                 kconfctl_parse_i64("1", (int64_t *)0), false);
+  }
+
+  printf("--- kconfctl config core verified\n");
+}
+
+/*
+ * banhammer_cli_core - the panic-text selector's pure logic.
+ *
+ * It has no state and no I/O, so this drives the command classifier, the
+ * category parser (including the unbacked `recovery` name and case sensitivity),
+ * the table sizes, every table slot, the selector's agreement with the table at
+ * the index its LCG names, and the unsigned seed parser including both overflow
+ * boundaries.  The LCG is re-derived here independently so the test pins the
+ * selector's choice rather than echoing the header's own computation.
+ */
+static uint64_t banhammer_cli_core_lcg(uint64_t seed) {
+  return (seed ^ 0x5DEECE66DULL) * 0x27BB2EE687BULL + 0xBULL;
+}
+
+static void test_banhammer_cli_core(void) {
+  uint64_t v = 0u;
+
+  printf("\n=== banhammer_cli panic-text core ===\n");
+
+  check_window("classify(NULL) is NONE",
+               bh_cli_classify((const char *)0) == BH_CLI_CMD_NONE, true);
+  check_window("classify(\"help\") is HELP",
+               bh_cli_classify("help") == BH_CLI_CMD_HELP, true);
+  check_window("classify(\"quote\") is QUOTE",
+               bh_cli_classify("quote") == BH_CLI_CMD_QUOTE, true);
+  check_window("classify(\"list\") is LIST",
+               bh_cli_classify("list") == BH_CLI_CMD_LIST, true);
+  check_window("classify(\"count\") is COUNT",
+               bh_cli_classify("count") == BH_CLI_CMD_COUNT, true);
+  check_window("classify(\"categories\") is CATEGORIES",
+               bh_cli_classify("categories") == BH_CLI_CMD_CATEGORIES, true);
+  check_window("classify(\"frobnicate\") is UNKNOWN",
+               bh_cli_classify("frobnicate") == BH_CLI_CMD_UNKNOWN, true);
+
+  /* Category names.  "recovery" is declared by the text header's enum but has
+   * no distinct table, so it must resolve to UNSUPPORTED, not to a real
+   * category and not to UNKNOWN.  Matching is case- and whitespace-sensitive. */
+  check_window("category(NULL) is UNKNOWN",
+               bh_cli_category((const char *)0) == BH_CLI_CAT_UNKNOWN, true);
+  check_window("category(\"sarcastic\") is SARCASTIC",
+               bh_cli_category("sarcastic") == BH_CLI_CAT_SARCASTIC, true);
+  check_window("category(\"informational\") is INFORMATIONAL",
+               bh_cli_category("informational") == BH_CLI_CAT_INFORMATIONAL, true);
+  check_window("category(\"recovery\") is UNSUPPORTED",
+               bh_cli_category("recovery") == BH_CLI_CAT_UNSUPPORTED, true);
+  check_window("category(\"Sarcastic\") is UNKNOWN (case-sensitive)",
+               bh_cli_category("Sarcastic") == BH_CLI_CAT_UNKNOWN, true);
+  check_window("category(\"sarcastic \") is UNKNOWN (no trimming)",
+               bh_cli_category("sarcastic ") == BH_CLI_CAT_UNKNOWN, true);
+
+  check_window("name(SARCASTIC) == \"sarcastic\"",
+               bh_cli_str_eq(bh_cli_category_name(BH_CLI_CAT_SARCASTIC),
+                             "sarcastic"), true);
+  check_window("name(INFORMATIONAL) == \"informational\"",
+               bh_cli_str_eq(bh_cli_category_name(BH_CLI_CAT_INFORMATIONAL),
+                             "informational"), true);
+  check_window("name(UNSUPPORTED) == NULL",
+               bh_cli_category_name(BH_CLI_CAT_UNSUPPORTED) == (const char *)0,
+               true);
+
+  /* Table sizes: the counts the header's sizeof-derived macros report. */
+  check_window("sarcastic count == 10",
+               bh_cli_count(BH_CLI_CAT_SARCASTIC) == 10u, true);
+  check_window("informational count == 8",
+               bh_cli_count(BH_CLI_CAT_INFORMATIONAL) == 8u, true);
+  check_window("unsupported category count == 0",
+               bh_cli_count(BH_CLI_CAT_UNSUPPORTED) == 0u, true);
+  check_window("unknown category count == 0",
+               bh_cli_count(BH_CLI_CAT_UNKNOWN) == 0u, true);
+
+  /* Direct table access: first and last entries reachable, first past-the-end
+   * and every unbacked category are NULL. */
+  check_window("sarcastic[0] is \"Well, that was graceful.\"",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 0u),
+                             "Well, that was graceful."), true);
+  check_window("sarcastic[9] is the last quote",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 9u),
+                             "You have unlocked the secret BANhammer emergency "
+                             "halt achievement."), true);
+  check_window("sarcastic[10] is past the end",
+               bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 10u) == (const char *)0,
+               true);
+  check_window("informational[0] is present",
+               bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 0u) != (const char *)0,
+               true);
+  check_window("informational[7] is the last quote",
+               bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 7u) != (const char *)0,
+               true);
+  check_window("informational[8] is past the end",
+               bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 8u) == (const char *)0,
+               true);
+  check_window("unsupported category has no entries",
+               bh_cli_quote_at(BH_CLI_CAT_UNSUPPORTED, 0u) == (const char *)0,
+               true);
+
+  /* Every quote, verbatim and in order.  The expected literals are respelled
+   * here so a dropped entry, a reordered row, or a changed word in the header
+   * fails the harness instead of silently changing what the kernel prints. */
+  check_window("sarcastic[0] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 0u),
+                             "Well, that was graceful."), true);
+  check_window("sarcastic[1] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 1u),
+                             "Congratulations, you hit the B+ trap jackpot!"),
+               true);
+  check_window("sarcastic[2] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 2u),
+                             "Have you tried turning the kernel off and never "
+                             "turning it on again?"), true);
+  check_window("sarcastic[3] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 3u),
+                             "Kernel went out for milk. It is not coming back."),
+               true);
+  check_window("sarcastic[4] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 4u),
+                             "A wild BANcode appeared! It was super effective."),
+               true);
+  check_window("sarcastic[5] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 5u),
+                             "Oops, all traps."), true);
+  check_window("sarcastic[6] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 6u),
+                             "The kernel has encountered a fatal moment of "
+                             "philosophical self-doubt."), true);
+  check_window("sarcastic[7] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 7u),
+                             "System crashed successfully. No humans were harmed "
+                             "in this disaster."), true);
+  check_window("sarcastic[8] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 8u),
+                             "Divide by cucumber error. Please reinstall universe "
+                             "and reboot."), true);
+  check_window("sarcastic[9] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 9u),
+                             "You have unlocked the secret BANhammer emergency "
+                             "halt achievement."), true);
+  check_window("informational[0] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 0u),
+                             "Hardware Translation Layer reported unrecoverable "
+                             "bus stall."), true);
+  check_window("informational[1] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 1u),
+                             "Sentinel recovery was invoked, but damage exceeded "
+                             "threshold."), true);
+  check_window("informational[2] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 2u),
+                             "Page fault in ring-0 without matching PML4 "
+                             "descriptor."), true);
+  check_window("informational[3] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 3u),
+                             "Kernel integrity trap triggered by invalid state "
+                             "vector."), true);
+  check_window("informational[4] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 4u),
+                             "Zero-allocation static buffer bounds overrun "
+                             "intercepted by guard page."), true);
+  check_window("informational[5] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 5u),
+                             "Volume Indexing Protocol (VIP) root partition "
+                             "checksum mismatch."), true);
+  check_window("informational[6] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 6u),
+                             "Modular Bootloader handoff descriptor corrupted in "
+                             "early stage."), true);
+  check_window("informational[7] verbatim",
+               bh_cli_str_eq(bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 7u),
+                             "Non-maskable interrupt fired during critical "
+                             "spinlock acquisition."), true);
+
+  /* The selector must land on exactly the slot the LCG names, for a seed whose
+   * residue is 0 (seed 0) and one whose residue is non-zero (seed 1).  This
+   * catches an off-by-one or a wrong modulus that a "returns something"
+   * assertion would miss. */
+  check_window("select(sarcastic, seed 0) is slot 0",
+               bh_cli_str_eq(bh_cli_select(BH_CLI_CAT_SARCASTIC, 0u),
+                             bh_cli_quote_at(BH_CLI_CAT_SARCASTIC,
+                                             (uint32_t)(banhammer_cli_core_lcg(0u)
+                                                        % 10u))), true);
+  check_window("select(sarcastic, seed 1) is slot 7",
+               bh_cli_str_eq(bh_cli_select(BH_CLI_CAT_SARCASTIC, 1u),
+                             bh_cli_quote_at(BH_CLI_CAT_SARCASTIC, 7u)), true);
+  check_window("select(sarcastic, seed 1) is the crash quote",
+               bh_cli_str_eq(bh_cli_select(BH_CLI_CAT_SARCASTIC, 1u),
+                             "System crashed successfully. No humans were "
+                             "harmed in this disaster."), true);
+  check_window("select(informational, seed 1) is slot 7",
+               bh_cli_str_eq(bh_cli_select(BH_CLI_CAT_INFORMATIONAL, 1u),
+                             bh_cli_quote_at(BH_CLI_CAT_INFORMATIONAL, 7u)),
+               true);
+  check_window("select on an unbacked category is NULL",
+               bh_cli_select(BH_CLI_CAT_UNSUPPORTED, 0u) == (const char *)0,
+               true);
+  check_window("select on an unknown category is NULL",
+               bh_cli_select(BH_CLI_CAT_UNKNOWN, 0u) == (const char *)0, true);
+
+  /* Unsigned seed parsing: decimal and 0x-hex accepted, every malformed shape
+   * rejected, and both overflow boundaries pinned. */
+  check_window("parse \"0\"", bh_cli_parse_u64("0", &v) && v == 0u, true);
+  check_window("parse \"12345\"",
+               bh_cli_parse_u64("12345", &v) && v == 12345u, true);
+  check_window("parse \"0x1\"",
+               bh_cli_parse_u64("0x1", &v) && v == 1u, true);
+  check_window("parse \"0xFF\"",
+               bh_cli_parse_u64("0xFF", &v) && v == 255u, true);
+  check_window("parse \"0xdeadBEEF\"",
+               bh_cli_parse_u64("0xdeadBEEF", &v) && v == 0xDEADBEEFu, true);
+  check_window("parse UINT64_MAX decimal",
+               bh_cli_parse_u64("18446744073709551615", &v) &&
+                   v == UINT64_MAX, true);
+  check_window("parse UINT64_MAX hex",
+               bh_cli_parse_u64("0xFFFFFFFFFFFFFFFF", &v) && v == UINT64_MAX,
+               true);
+
+  check_window("parse \"\" fails", bh_cli_parse_u64("", &v), false);
+  check_window("parse \"0x\" fails", bh_cli_parse_u64("0x", &v), false);
+  check_window("parse \"0xg\" fails", bh_cli_parse_u64("0xg", &v), false);
+  check_window("parse \"-1\" fails (no signs)",
+               bh_cli_parse_u64("-1", &v), false);
+  check_window("parse \"+1\" fails",
+               bh_cli_parse_u64("+1", &v), false);
+  check_window("parse \"12a\" fails", bh_cli_parse_u64("12a", &v), false);
+  check_window("parse \" 1\" fails", bh_cli_parse_u64(" 1", &v), false);
+  check_window("parse \"1 \" fails", bh_cli_parse_u64("1 ", &v), false);
+  check_window("parse decimal overflow fails",
+               bh_cli_parse_u64("18446744073709551616", &v), false);
+  check_window("parse hex overflow fails",
+               bh_cli_parse_u64("0x10000000000000000", &v), false);
+  check_window("parse(NULL) fails",
+               bh_cli_parse_u64((const char *)0, &v), false);
+  check_window("parse with NULL out fails",
+               bh_cli_parse_u64("1", (uint64_t *)0), false);
+
+  printf("--- banhammer_cli panic-text core verified\n");
+}
+
+/* ------------------------------------------------------------------------- */
+/* Testing-report regressions                                                 */
+/* ------------------------------------------------------------------------- */
+
+/* Two findings from the external testing report are pure logic and can be
+ * pinned on the host rather than only in a QEMU transcript:
+ *
+ *   1. `status` reported a fixed "4096 pages" because nothing ever parsed the
+ *      bootloader's memory map.  OwMemSetBootInfo() must turn a multiboot info
+ *      block into a firmware-RAM size, and must ignore a block that does not
+ *      carry the mem_* fields (or that is not multiboot at all).
+ *   2. A SUCS mode switch was staged but never applied in the RAM-disk
+ *      environment, so EXTENDED was unreachable.  OwSucsCommitNow() must apply
+ *      the staged mode, and requesting a mode must key off the *committed*
+ *      mode, otherwise a second switch (back to BASE) is impossible. */
+uint64_t ow_strtoull(const char *s, char **end, uint32_t base);
+
+static void test_report_regressions(void) {
+  printf("\n=== Testing-report regressions ===\n");
+
+  {
+    uint32_t mbi[3];
+
+    mbi[0] = 0x1u;      /* flags: bit 0 => mem_* fields present */
+    mbi[1] = 640u;      /* mem_lower KiB (not used by the kernel) */
+    mbi[2] = 261120u;   /* mem_upper KiB => 255 MiB above the first MiB */
+
+    check_window("no firmware map until the bootloader supplies one",
+                 OwMemFirmwareBytes() == 0ull, true);
+
+    OwMemSetBootInfo(0x2BADB002u, (uint64_t)(uintptr_t)mbi);
+    check_window("firmware RAM = 1 MiB + mem_upper (256 MiB)",
+                 OwMemFirmwareBytes() == 268435456ull, true);
+    check_window("firmware RAM in 4-KiB pages (65536)",
+                 OwMemFirmwarePages() == 65536u, true);
+
+    /* A block lacking the mem_* flag is not a memory map. */
+    mbi[0] = 0u;
+    OwMemSetBootInfo(0x2BADB002u, (uint64_t)(uintptr_t)mbi);
+    check_window("a block without mem_* leaves the figure unchanged",
+                 OwMemFirmwareBytes() == 268435456ull, true);
+
+    /* A block that is not multiboot at all is ignored outright. */
+    mbi[0] = 1u;
+    OwMemSetBootInfo(0xDEADBEEFu, (uint64_t)(uintptr_t)mbi);
+    check_window("a wrong bootloader magic is ignored",
+                 OwMemFirmwareBytes() == 268435456ull, true);
+  }
+
+  {
+    /* ow_strtoull() must saturate at UINT64_MAX instead of wrapping, so a
+     * decimal size above the 64-bit range is refused by the shell's alloc guard
+     * rather than silently wrapping to a tiny allocation.  Before this it
+     * wrapped: `alloc 18446744073709551617` produced a 1-page "success". */
+    check_window("strtoull(UINT64_MAX) is exact",
+                 ow_strtoull("18446744073709551615", (char **)0, 10) ==
+                     UINT64_MAX,
+                 true);
+    check_window("strtoull(UINT64_MAX + 1) saturates",
+                 ow_strtoull("18446744073709551616", (char **)0, 10) ==
+                     UINT64_MAX,
+                 true);
+    check_window("strtoull(UINT64_MAX + 2) saturates",
+                 ow_strtoull("18446744073709551617", (char **)0, 10) ==
+                     UINT64_MAX,
+                 true);
+    check_window("strtoull(21 nines) saturates",
+                 ow_strtoull("999999999999999999999", (char **)0, 10) ==
+                     UINT64_MAX,
+                 true);
+    check_window("strtoull(0xFFFFFFFFFFFFFFFF) is exact",
+                 ow_strtoull("0xFFFFFFFFFFFFFFFF", (char **)0, 16) ==
+                     UINT64_MAX,
+                 true);
+    check_window("strtoull(0x10000000000000000) saturates",
+                 ow_strtoull("0x10000000000000000", (char **)0, 16) ==
+                     UINT64_MAX,
+                 true);
+  }
+
+  {
+    /* The auto-init script already staged and committed a switch, so the active
+     * mode here is whatever it left behind.  Read it and drive the test to the
+     * other mode rather than assuming BASE -- the point is the state machine,
+     * not the particular starting value. */
+    int before = OwSucsActiveMode();
+    int other = (before == (int)SUCS_MODE_EXTENDED) ? (int)SUCS_MODE_BASE
+                                                    : (int)SUCS_MODE_EXTENDED;
+
+    check_window("requesting the other mode is staged, not applied",
+                 OwSucsRequestModeSwitch(other) == SUCS_SWITCH_REBOOT_REQUIRED,
+                 true);
+    check_window("active mode is unchanged while staged",
+                 OwSucsActiveMode() == before, true);
+    check_window("commit applies the staged mode",
+                 OwSucsCommitNow(), true);
+    check_window("active mode is the staged mode after commit",
+                 OwSucsActiveMode() == other, true);
+    check_window("nothing to commit once the modes agree",
+                 OwSucsCommitNow(), false);
+
+    /* The switch must be reversible.  This is the assertion that fails if the
+     * request decision is left keyed off the library's private, never-advanced
+     * copy of the active mode instead of the kernel's committed one. */
+    check_window("requesting the original mode after a live commit is staged",
+                 OwSucsRequestModeSwitch(before) == SUCS_SWITCH_REBOOT_REQUIRED,
+                 true);
+    check_window("commit applies the original mode again",
+                 OwSucsCommitNow(), true);
+    check_window("active mode is back to the original",
+                 OwSucsActiveMode() == before, true);
+  }
+
+  printf("--- testing-report regressions verified\n");
+}
+
+/* -------------------------------------------------------------------- */
+/* Kernel Dual Boot (KDB) / KAPA                                        */
+/* -------------------------------------------------------------------- */
+/* KDB manages associated kernels on behalf of KAPA applications.  The cases
+ * below follow the implementation's own seams -- registry, compatibility
+ * policy, loader front-end, associations, lifecycle/resource admission and the
+ * Service Bridge -- because an end-to-end happy path alone would not show which
+ * layer refused an incompatible kernel or which resources a fault released. */
+
+static void kdb_test_name(char *Dst, const char *Src) {
+  size_t i = 0u;
+
+  while (i + 1u < (size_t)OW_KDB_MAX_NAME && Src[i] != '\0') {
+    Dst[i] = Src[i];
+    ++i;
+  }
+  Dst[i] = '\0';
+}
+
+static void kdb_test_desc(OW_KDB_KERNEL_DESC *Desc, const char *Name,
+                          OW_KDB_KERNEL_KIND Kind, uint32_t Abi,
+                          uint32_t Format) {
+  memset(Desc, 0, sizeof(*Desc));
+  kdb_test_name(Desc->Name, Name);
+  Desc->Kind = Kind;
+  Desc->Abi = Abi;
+  Desc->Format = Format;
+  Desc->MemoryModel = OW_KDB_MEMORY_PRIVATE;
+  Desc->PrivilegeModel = OW_KDB_PRIVILEGE_UNPRIVILEGED;
+  Desc->TargetArch = OW_KDB_ARCH_X86_64;
+  Desc->Image = g_owinit_image;
+  Desc->ImageSize = OWINIT_IMAGE_SIZE;
+}
+
+static OW_STATUS kdb_test_echo_handler(uint32_t ServiceId,
+                                       const uint8_t *Request,
+                                       uint32_t RequestLength,
+                                       uint8_t *Response,
+                                       uint32_t ResponseCapacity,
+                                       uint32_t *ResponseLength,
+                                       void *Context) {
+  uint32_t i;
+
+  (void)ServiceId;
+  (void)Context;
+
+  if (RequestLength > ResponseCapacity) {
+    return OW_ERR_INSUFFICIENT;
+  }
+  for (i = 0u; i < RequestLength; ++i) {
+    Response[i] = Request[i];
+  }
+  *ResponseLength = RequestLength;
+  return OW_SUCCESS;
+}
+
+static OW_STATUS kdb_test_fail_handler(uint32_t ServiceId,
+                                       const uint8_t *Request,
+                                       uint32_t RequestLength,
+                                       uint8_t *Response,
+                                       uint32_t ResponseCapacity,
+                                       uint32_t *ResponseLength,
+                                       void *Context) {
+  (void)ServiceId;
+  (void)Request;
+  (void)RequestLength;
+  (void)Response;
+  (void)ResponseCapacity;
+  (void)Context;
+  *ResponseLength = 0u;
+  return OW_ERR_IO;
+}
+
+/* Claims more bytes than the bridge handed it.  The bridge must reject the
+ * result and copy nothing back, even though the handler returned OW_SUCCESS. */
+static OW_STATUS kdb_test_overrun_handler(uint32_t ServiceId,
+                                          const uint8_t *Request,
+                                          uint32_t RequestLength,
+                                          uint8_t *Response,
+                                          uint32_t ResponseCapacity,
+                                          uint32_t *ResponseLength,
+                                          void *Context) {
+  (void)ServiceId;
+  (void)Request;
+  (void)RequestLength;
+  (void)Response;
+  (void)Context;
+  *ResponseLength = ResponseCapacity + 1u;
+  return OW_SUCCESS;
+}
+
+/* Stub executor backends for the seam tests.  The real PS backend refuses
+ * everything that CIS cannot verify, which makes it untestable for the
+ * plan-handoff semantics in a host harness that never runs a CPU; a stub
+ * backend is the only way to pin the seam's contract:
+ *   - a backend that returns SUCCESS must not fabricate RUNNING,
+ *   - a backend that fails must fault the instance through the normal path,
+ *   - a missing backend must refuse without touching instance state. */
+static int g_stub_calls = 0;
+static int g_stub_fail = 0;
+
+static OW_STATUS kdb_test_stub_backend(const OW_KDB_LAUNCH_PLAN *Plan,
+                                         void *Context) {
+  (void)Context;
+  g_stub_calls++;
+  if (Plan == (const OW_KDB_LAUNCH_PLAN *)0) return OW_ERR_NULL_POINTER;
+  if (g_stub_fail) return OW_ERR_IO;
+  /* Accept the validated plan and touch nothing; the seam must not confuse
+   * "executor accepted the plan" with "the CPU is executing the image". */
+  return OW_SUCCESS;
+}
+
+static void test_kdb(void) {
+  static OW_KDB_KERNEL_DESC desc;
+  static uint8_t corrupt[OWINIT_IMAGE_SIZE];
+  static uint8_t request[OW_KDB_BRIDGE_MAX_REQUEST];
+  static uint8_t response[OW_KDB_BRIDGE_MAX_RESPONSE];
+  OW_KDB_KERNEL_DESC out;
+  OW_KDB_COMPAT_REPORT report;
+  OW_KDB_ASSOCIATION assoc;
+  OW_KDB_INSTANCE inst;
+  OW_KDB_STATS stats;
+  OW_STATUS st;
+  uint32_t sweep_kernel = OW_KDB_INVALID_ID;
+  uint32_t native_kernel = OW_KDB_INVALID_ID;
+  uint32_t found = OW_KDB_INVALID_ID;
+  uint32_t sweep_app = OW_KDB_INVALID_ID;
+  uint32_t demo_app = OW_KDB_INVALID_ID;
+  uint32_t other_app = OW_KDB_INVALID_ID;
+  uint32_t admin_app = OW_KDB_INVALID_ID;
+  uint32_t nocap_app = OW_KDB_INVALID_ID;
+  uint32_t budget_app = OW_KDB_INVALID_ID;
+  uint32_t sweep_live = OW_KDB_INVALID_ID;
+  uint32_t demo_inst = OW_KDB_INVALID_ID;
+  uint32_t budget_inst = OW_KDB_INVALID_ID;
+  uint32_t sweep_inst = OW_KDB_INVALID_ID;
+  const uint32_t demo_service = 0x4B44A001u;
+  const uint32_t sweep_service = 0x4B44A101u;
+  const uint32_t expected_pages =
+      (OWINIT_IMAGE_SIZE + OW_PAGE_SIZE - 1u) / OW_PAGE_SIZE;
+  uint32_t pages = 0u;
+  uint32_t len = 0u;
+  uint32_t services_before = 0u;
+
+  printf("\n=== Kernel Dual Boot / KAPA ===\n");
+
+  /* ---- Initialization and the built-in reference ------------------- */
+  check_window("KDB is ready after the boot phase", OwKdbIsReady(), true);
+  OwKdbGetStats(&stats);
+  check_eq("KDB registers the Sweep reference at init",
+           (unsigned long)stats.Kernels, 1ul);
+  check_eq("KDB exposes four main-kernel services",
+           (unsigned long)stats.Services, 4ul);
+  check_eq("KDB starts with no associations",
+           (unsigned long)stats.Associations, 0ul);
+  check_eq("KDB starts with no instances", (unsigned long)stats.Instances, 0ul);
+
+  st = OwKdbFindKernel(OW_KDB_SWEEP_NAME, &sweep_kernel);
+  check_eq("the Sweep reference is findable by name", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbGetKernel(sweep_kernel, &out);
+  check_eq("the Sweep reference is queryable", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("Sweep is a stripped OpenWindows kernel", (unsigned long)out.Kind,
+           (unsigned long)OW_KDB_KIND_STRIPPED_OPENWINDOWS);
+  check_window("Sweep is declarative while no image exists",
+               (out.Flags & OW_KDB_DESC_DECLARATIVE) != 0u, true);
+  check_window("the declarative Sweep descriptor carries no image",
+               out.Image == (const uint8_t *)0 && out.ImageSize == 0u, true);
+  check_eq("re-registering the reference descriptor is refused",
+           (unsigned long)OwKdbRegisterSweep((const uint8_t *)0, 0u,
+                                             (uint32_t *)0),
+           (unsigned long)OW_ERR_ALREADY_EXISTS);
+
+  /* ---- Registry ---------------------------------------------------- */
+  kdb_test_desc(&desc, "native-test", OW_KDB_KIND_NATIVE_OPENWINDOWS,
+                OW_KDB_ABI_OPENWINDOWS_NATIVE, OW_KDB_FORMAT_OWX);
+  st = OwKdbRegisterKernel(&desc, &native_kernel);
+  check_eq("a coherent native descriptor registers", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_window("registration returns a non-zero kernel id",
+               native_kernel != OW_KDB_INVALID_ID, true);
+  check_eq("duplicate kernel names are refused",
+           (unsigned long)OwKdbRegisterKernel(&desc, (uint32_t *)0),
+           (unsigned long)OW_ERR_ALREADY_EXISTS);
+
+  kdb_test_desc(&desc, "", OW_KDB_KIND_NATIVE_OPENWINDOWS,
+                OW_KDB_ABI_OPENWINDOWS_NATIVE, OW_KDB_FORMAT_OWX);
+  check_eq("an empty descriptor name is refused",
+           (unsigned long)OwKdbRegisterKernel(&desc, (uint32_t *)0),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+  check_eq("a null descriptor is refused",
+           (unsigned long)OwKdbRegisterKernel(
+               (const OW_KDB_KERNEL_DESC *)0, (uint32_t *)0),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+
+  st = OwKdbFindKernel("native-test", &found);
+  check_eq("a registered kernel is findable by name", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("find returns the registered id", (unsigned long)found,
+           (unsigned long)native_kernel);
+  st = OwKdbGetKernel(native_kernel, &out);
+  check_eq("a registered kernel round-trips", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("the round-tripped descriptor keeps its ABI",
+           (unsigned long)out.Abi, (unsigned long)OW_KDB_ABI_OPENWINDOWS_NATIVE);
+  st = OwKdbGetKernelByIndex(1u, &out);
+  check_eq("a registered kernel is enumerable by index", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("index 1 is the native descriptor", (unsigned long)out.Kind,
+           (unsigned long)OW_KDB_KIND_NATIVE_OPENWINDOWS);
+  check_eq("an out-of-range kernel index is not found",
+           (unsigned long)OwKdbGetKernelByIndex(99u, &out),
+           (unsigned long)OW_ERR_NOT_FOUND);
+  check_eq("a null kernel output is refused",
+           (unsigned long)OwKdbGetKernel(native_kernel, (OW_KDB_KERNEL_DESC *)0),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+  check_eq("kernel id zero is refused",
+           (unsigned long)OwKdbGetKernel(OW_KDB_INVALID_ID, &out),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+
+  /* ---- Compatibility policy ---------------------------------------- */
+  kdb_test_desc(&desc, "compat", OW_KDB_KIND_NATIVE_OPENWINDOWS,
+                OW_KDB_ABI_OPENWINDOWS_NATIVE, OW_KDB_FORMAT_OWX);
+  st = OwKdbAssessCompatibility(&desc, &report);
+  check_eq("a coherent native descriptor is compatible", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("the compatibility verdict is COMPATIBLE",
+           (unsigned long)report.Verdict, (unsigned long)OW_KDB_COMPATIBLE);
+
+  kdb_test_desc(&desc, "compat", OW_KDB_KIND_NATIVE_OPENWINDOWS,
+                OW_KDB_ABI_OPENWINDOWS_NATIVE, OW_KDB_FORMAT_OWX);
+  desc.TargetArch = 0u;
+  st = OwKdbAssessCompatibility(&desc, &report);
+  check_eq("a foreign target architecture is refused", (unsigned long)st,
+           (unsigned long)OW_ERR_UNSUPPORTED);
+  check_eq("the verdict names the architecture",
+           (unsigned long)report.Verdict,
+           (unsigned long)OW_KDB_COMPAT_ARCH_MISMATCH);
+
+  kdb_test_desc(&desc, "compat", OW_KDB_KIND_NATIVE_OPENWINDOWS,
+                OW_KDB_ABI_LINUX_X86_64, OW_KDB_FORMAT_OWX);
+  st = OwKdbAssessCompatibility(&desc, &report);
+  check_eq("a native kernel with a foreign ABI is refused", (unsigned long)st,
+           (unsigned long)OW_ERR_UNSUPPORTED);
+  check_eq("the verdict names the ABI", (unsigned long)report.Verdict,
+           (unsigned long)OW_KDB_COMPAT_ABI_MISMATCH);
+
+  kdb_test_desc(&desc, "compat", OW_KDB_KIND_NATIVE_OPENWINDOWS,
+                OW_KDB_ABI_OPENWINDOWS_NATIVE, OW_KDB_FORMAT_ELF);
+  st = OwKdbAssessCompatibility(&desc, &report);
+  check_eq("an OpenWindows kernel must carry OWX", (unsigned long)st,
+           (unsigned long)OW_ERR_UNSUPPORTED);
+  check_eq("the verdict names the format", (unsigned long)report.Verdict,
+           (unsigned long)OW_KDB_COMPAT_FORMAT_MISMATCH);
+
+  kdb_test_desc(&desc, "compat", OW_KDB_KIND_NATIVE_OPENWINDOWS,
+                OW_KDB_ABI_OPENWINDOWS_NATIVE, OW_KDB_FORMAT_OWX);
+  desc.MemoryModel = OW_KDB_MEMORY_SHARED;
+  st = OwKdbAssessCompatibility(&desc, &report);
+  check_eq("a shared-memory kernel is refused", (unsigned long)st,
+           (unsigned long)OW_ERR_UNSUPPORTED);
+  check_eq("the verdict names the memory model", (unsigned long)report.Verdict,
+           (unsigned long)OW_KDB_COMPAT_MEMORY_MODEL);
+
+  kdb_test_desc(&desc, "compat", OW_KDB_KIND_NATIVE_OPENWINDOWS,
+                OW_KDB_ABI_OPENWINDOWS_NATIVE, OW_KDB_FORMAT_OWX);
+  desc.PrivilegeModel = OW_KDB_PRIVILEGE_KERNEL_EQUIVALENT;
+  st = OwKdbAssessCompatibility(&desc, &report);
+  check_eq("a kernel-equivalent privilege request is refused",
+           (unsigned long)st, (unsigned long)OW_ERR_UNSUPPORTED);
+  check_eq("the verdict names the privilege model",
+           (unsigned long)report.Verdict,
+           (unsigned long)OW_KDB_COMPAT_PRIVILEGE_MODEL);
+
+  kdb_test_desc(&desc, "linux", OW_KDB_KIND_LINUX, OW_KDB_ABI_LINUX_X86_64,
+                OW_KDB_FORMAT_ELF);
+  st = OwKdbAssessCompatibility(&desc, &report);
+  check_eq("a well-formed Linux descriptor has no adapter",
+           (unsigned long)st, (unsigned long)OW_ERR_UNSUPPORTED);
+  check_eq("the Linux verdict is UNSUPPORTED_KIND",
+           (unsigned long)report.Verdict,
+           (unsigned long)OW_KDB_COMPAT_UNSUPPORTED_KIND);
+
+  kdb_test_desc(&desc, "custom", OW_KDB_KIND_CUSTOM, OW_KDB_ABI_CUSTOM,
+                OW_KDB_FORMAT_RAW);
+  st = OwKdbAssessCompatibility(&desc, &report);
+  check_eq("a well-formed custom descriptor has no adapter",
+           (unsigned long)st, (unsigned long)OW_ERR_UNSUPPORTED);
+  check_eq("the custom verdict is UNSUPPORTED_KIND",
+           (unsigned long)report.Verdict,
+           (unsigned long)OW_KDB_COMPAT_UNSUPPORTED_KIND);
+
+  kdb_test_desc(&desc, "linux-bad-format", OW_KDB_KIND_LINUX,
+                OW_KDB_ABI_LINUX_X86_64, OW_KDB_FORMAT_OWX);
+  st = OwKdbAssessCompatibility(&desc, &report);
+  check_eq("a Linux descriptor with an OWX format is refused",
+           (unsigned long)st, (unsigned long)OW_ERR_UNSUPPORTED);
+  check_eq("the Linux format verdict is explicit",
+           (unsigned long)report.Verdict,
+           (unsigned long)OW_KDB_COMPAT_FORMAT_MISMATCH);
+
+  check_eq("a null compatibility report is refused",
+           (unsigned long)OwKdbAssessCompatibility(
+               &desc, (OW_KDB_COMPAT_REPORT *)0),
+           (unsigned long)OW_ERR_NULL_POINTER);
+  check_eq("a null descriptor is reported as invalid",
+           (unsigned long)OwKdbAssessCompatibility(
+               (const OW_KDB_KERNEL_DESC *)0, &report),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+  check_eq("the null-descriptor verdict is INVALID_DESCRIPTOR",
+           (unsigned long)report.Verdict,
+           (unsigned long)OW_KDB_COMPAT_INVALID_DESCRIPTOR);
+
+  /* ---- Loader front-end -------------------------------------------- */
+  check_window("the loader supports native OpenWindows",
+               OwKdbLoaderSupports(OW_KDB_KIND_NATIVE_OPENWINDOWS), true);
+  check_window("the loader supports stripped OpenWindows",
+               OwKdbLoaderSupports(OW_KDB_KIND_STRIPPED_OPENWINDOWS), true);
+  check_window("the loader supports modified OpenWindows",
+               OwKdbLoaderSupports(OW_KDB_KIND_MODIFIED_OPENWINDOWS), true);
+  check_window("the loader does not claim Linux support",
+               OwKdbLoaderSupports(OW_KDB_KIND_LINUX), false);
+  check_window("the loader does not claim custom-kernel support",
+               OwKdbLoaderSupports(OW_KDB_KIND_CUSTOM), false);
+
+  kdb_test_desc(&desc, "loader-native", OW_KDB_KIND_NATIVE_OPENWINDOWS,
+                OW_KDB_ABI_OPENWINDOWS_NATIVE, OW_KDB_FORMAT_OWX);
+  st = OwKdbLoaderValidate(&desc, &pages);
+  check_eq("a valid OWX image is accepted by the loader front-end",
+           (unsigned long)st, (unsigned long)OW_SUCCESS);
+  check_eq("resident pages derive from the delivered image length",
+           (unsigned long)pages, (unsigned long)expected_pages);
+  check_eq("a null page output is refused",
+           (unsigned long)OwKdbLoaderValidate(&desc, (uint32_t *)0),
+           (unsigned long)OW_ERR_NULL_POINTER);
+
+  /* One flipped byte in the final payload must fail the whole-image CRC, not
+   * merely the header structure the loader could otherwise accept. */
+  memcpy(corrupt, g_owinit_image, OWINIT_IMAGE_SIZE);
+  corrupt[OWINIT_IMAGE_SIZE - 1u] ^= 0xFFu;
+  desc.Image = corrupt;
+  desc.ImageSize = OWINIT_IMAGE_SIZE;
+  st = OwKdbLoaderValidate(&desc, &pages);
+  check_eq("a CRC-invalid OWX image is refused", (unsigned long)st,
+           (unsigned long)OW_ERR_CORRUPT);
+
+  st = OwKdbGetKernel(sweep_kernel, &out);
+  check_eq("the declarative Sweep descriptor is queryable", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbLoaderValidate(&out, &pages);
+  check_eq("a declarative Sweep descriptor cannot be loaded",
+           (unsigned long)st, (unsigned long)OW_ERR_UNSUPPORTED);
+
+  /* ---- Associations ------------------------------------------------ */
+  st = OwKdbAssociateApplication("sweep-app", sweep_kernel, OW_KDB_CAP_CALL,
+                                 &sweep_app);
+  check_eq("an application can associate with declarative Sweep",
+           (unsigned long)st, (unsigned long)OW_SUCCESS);
+  check_eq("duplicate application names are refused",
+           (unsigned long)OwKdbAssociateApplication(
+               "sweep-app", native_kernel, OW_KDB_CAP_CALL, (uint32_t *)0),
+           (unsigned long)OW_ERR_ALREADY_EXISTS);
+  check_eq("an unknown kernel id is refused",
+           (unsigned long)OwKdbAssociateApplication(
+               "ghost-app", 0xFFFFu, OW_KDB_CAP_CALL, (uint32_t *)0),
+           (unsigned long)OW_ERR_NOT_FOUND);
+  check_eq("unsupported capability bits are refused",
+           (unsigned long)OwKdbAssociateApplication(
+               "bad-caps", native_kernel, 0x00000008u, (uint32_t *)0),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+  check_eq("an empty application name is refused",
+           (unsigned long)OwKdbAssociateApplication(
+               "", native_kernel, OW_KDB_CAP_CALL, (uint32_t *)0),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+
+  st = OwKdbGetAssociation(sweep_app, &assoc);
+  check_eq("an association round-trips", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("the association remembers its capabilities",
+           (unsigned long)assoc.Capabilities, (unsigned long)OW_KDB_CAP_CALL);
+  check_window("an association starts with no instance",
+               assoc.InstanceId == OW_KDB_INVALID_ID, true);
+
+  st = OwKdbFindAssociation("sweep-app", &assoc);
+  check_eq("an association is findable by application", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("find returns the same association id", (unsigned long)assoc.Id,
+           (unsigned long)sweep_app);
+  check_eq("association id zero is refused",
+           (unsigned long)OwKdbGetAssociation(OW_KDB_INVALID_ID, &assoc),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+
+  st = OwKdbLoadInstance(sweep_app, 0u, &sweep_inst);
+  check_eq("the declarative Sweep descriptor refuses a load",
+           (unsigned long)st, (unsigned long)OW_ERR_UNSUPPORTED);
+  check_eq("disassociating an application succeeds",
+           (unsigned long)OwKdbDisassociateApplication(sweep_app),
+           (unsigned long)OW_SUCCESS);
+  check_eq("a removed association is no longer found",
+           (unsigned long)OwKdbGetAssociation(sweep_app, &assoc),
+           (unsigned long)OW_ERR_NOT_FOUND);
+
+  /* ---- Lifecycle and resource admission ---------------------------- */
+  st = OwKdbAssociateApplication(
+      "kapa-demo", native_kernel,
+      OW_KDB_CAP_CALL | OW_KDB_CAP_REGISTER_SERVICE, &demo_app);
+  check_eq("a KAPA application associates with a native kernel",
+           (unsigned long)st, (unsigned long)OW_SUCCESS);
+
+  st = OwKdbLoadInstance(demo_app, 64u, &demo_inst);
+  check_eq("the instance loads within its page budget", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_window("load returns a non-zero instance id",
+               demo_inst != OW_KDB_INVALID_ID, true);
+
+  st = OwKdbGetInstance(demo_inst, &inst);
+  check_eq("a loaded instance is queryable", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("a loaded instance starts READY", (unsigned long)inst.State,
+           (unsigned long)OW_KDB_INSTANCE_READY);
+  check_eq("the image page charge is recorded",
+           (unsigned long)inst.ResidentPages, (unsigned long)expected_pages);
+  check_eq("the requested page limit is recorded",
+           (unsigned long)inst.PageLimit, 64ul);
+  check_window("the instance has a non-zero isolation domain",
+               inst.IsolationDomain != 0u, true);
+  check_eq("the instance records its kernel", (unsigned long)inst.KernelId,
+           (unsigned long)native_kernel);
+  check_eq("the instance records its association",
+           (unsigned long)inst.AssociationId, (unsigned long)demo_app);
+  check_window("the loader supplied an entry point",
+               inst.EntryPoint != 0ull, true);
+
+  st = OwKdbGetAssociation(demo_app, &assoc);
+  check_eq("the association links to the loaded instance", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("the association names the instance", (unsigned long)assoc.InstanceId,
+           (unsigned long)demo_inst);
+
+  check_eq("an association owns at most one instance",
+           (unsigned long)OwKdbLoadInstance(demo_app, 64u, &found),
+           (unsigned long)OW_ERR_ALREADY_EXISTS);
+  check_eq("a kernel used by an association cannot be unregistered",
+           (unsigned long)OwKdbUnregisterKernel(native_kernel),
+           (unsigned long)OW_ERR_INSUFFICIENT);
+
+  check_eq("a READY instance starts",
+           (unsigned long)OwKdbStartInstance(demo_inst),
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbGetInstance(demo_inst, &inst);
+  check_eq("a started instance is RUNNING", (unsigned long)inst.State,
+           (unsigned long)OW_KDB_INSTANCE_RUNNING);
+  check_eq("starting a running instance is refused",
+           (unsigned long)OwKdbStartInstance(demo_inst),
+           (unsigned long)OW_ERR_ALREADY_EXISTS);
+  check_eq("stopping a running instance succeeds",
+           (unsigned long)OwKdbStopInstance(demo_inst),
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbGetInstance(demo_inst, &inst);
+  check_eq("a stopped instance is STOPPED", (unsigned long)inst.State,
+           (unsigned long)OW_KDB_INSTANCE_STOPPED);
+  check_eq("stopping an already stopped instance is harmless",
+           (unsigned long)OwKdbStopInstance(demo_inst),
+           (unsigned long)OW_SUCCESS);
+  check_eq("a stopped instance can be restarted",
+           (unsigned long)OwKdbStartInstance(demo_inst),
+           (unsigned long)OW_SUCCESS);
+
+  check_eq("one instance is live", (unsigned long)OwKdbInstanceCount(), 1ul);
+  st = OwKdbGetInstanceByIndex(0u, &inst);
+  check_eq("the instance is enumerable by index", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("enumeration returns the same instance",
+           (unsigned long)inst.Id, (unsigned long)demo_inst);
+  check_eq("an out-of-range instance index is not found",
+           (unsigned long)OwKdbGetInstanceByIndex(9u, &inst),
+           (unsigned long)OW_ERR_NOT_FOUND);
+  check_eq("instance id zero is refused",
+           (unsigned long)OwKdbGetInstance(OW_KDB_INVALID_ID, &inst),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+
+  st = OwKdbAssociateApplication("budget-app", native_kernel, 0u, &budget_app);
+  check_eq("a budget-test application associates", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbLoadInstance(budget_app, 1u, &budget_inst);
+  check_eq("a page budget smaller than the image is refused",
+           (unsigned long)st, (unsigned long)OW_ERR_INSUFFICIENT);
+  st = OwKdbLoadInstance(budget_app, 0u, &budget_inst);
+  check_eq("a zero budget selects the documented default",
+           (unsigned long)st, (unsigned long)OW_SUCCESS);
+  st = OwKdbGetInstance(budget_inst, &inst);
+  check_eq("the default page limit is recorded", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("the default page limit matches the public constant",
+           (unsigned long)inst.PageLimit,
+           (unsigned long)OW_KDB_DEFAULT_PAGE_LIMIT);
+  check_eq("destroying the budget instance succeeds",
+           (unsigned long)OwKdbDestroyInstance(budget_inst),
+           (unsigned long)OW_SUCCESS);
+  check_eq("a destroyed instance is no longer found",
+           (unsigned long)OwKdbGetInstance(budget_inst, &inst),
+           (unsigned long)OW_ERR_NOT_FOUND);
+
+  /* ---- Service Bridge: main-kernel services ------------------------ */
+  memset(request, 0, sizeof(request));
+  memset(response, 0, sizeof(response));
+  request[0] = (uint8_t)'h';
+  request[1] = (uint8_t)'e';
+  request[2] = (uint8_t)'l';
+  request[3] = (uint8_t)'l';
+  request[4] = (uint8_t)'o';
+
+  st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_PING,
+                       (const void *)0, 0u, response, sizeof(response), &len);
+  check_eq("a caller with CAP_CALL reaches main PING", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("PING reports eight bytes", (unsigned long)len, 8ul);
+  check_bytes("PING returns the documented payload", response,
+              (const uint8_t *)"kdb-pong", 8u);
+
+  st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_ECHO, request, 5u,
+                       response, sizeof(response), &len);
+  check_eq("main ECHO mirrors a request", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("ECHO reports the request length", (unsigned long)len, 5ul);
+  check_bytes("ECHO returns the request bytes", response, request, 5u);
+
+  st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_ECHO, request, 65u,
+                       response, sizeof(response), &len);
+  check_eq("ECHO refuses a request above its bound", (unsigned long)st,
+           (unsigned long)OW_ERR_INVALID_PARAM);
+
+  st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_PING, (const void *)0, 0u,
+                       response, 4u, &len);
+  check_eq("PING refuses an undersized response buffer", (unsigned long)st,
+           (unsigned long)OW_ERR_INSUFFICIENT);
+
+  st = OwKdbBridgeCall(demo_app, 0u, 0x4B44FFFFu, (const void *)0, 0u,
+                       response, sizeof(response), &len);
+  check_eq("an unknown service is not found", (unsigned long)st,
+           (unsigned long)OW_ERR_NOT_FOUND);
+
+  st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_PING, (const void *)0, 0u,
+                       response, sizeof(response), (uint32_t *)0);
+  check_eq("a null response length is refused", (unsigned long)st,
+           (unsigned long)OW_ERR_NULL_POINTER);
+
+  st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_PING, (const void *)0, 0u,
+                       (void *)0, sizeof(response), &len);
+  check_eq("a null response buffer with capacity is refused",
+           (unsigned long)st, (unsigned long)OW_ERR_NULL_POINTER);
+
+  st = OwKdbBridgeCall(30u, 0u, OW_KDB_SERVICE_PING, (const void *)0, 0u,
+                       response, sizeof(response), &len);
+  check_eq("an unknown caller association is refused", (unsigned long)st,
+           (unsigned long)OW_ERR_NOT_FOUND);
+
+  st = OwKdbAssociateApplication("no-cap", native_kernel, 0u, &nocap_app);
+  check_eq("a capability-free association is allowed", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbBridgeCall(nocap_app, 0u, OW_KDB_SERVICE_PING, (const void *)0, 0u,
+                       response, sizeof(response), &len);
+  check_eq("CAP_CALL is enforced for main services", (unsigned long)st,
+           (unsigned long)OW_ERR_INSUFFICIENT);
+
+  /* ---- Main-kernel services: log and runtime info (R3) -------------- */
+  {
+    const uint8_t *msg = (const uint8_t *)"kapa-log";
+    uint8_t maxmsg[128];
+    uint8_t small[7];
+    uint64_t t1 = 0ull;
+    uint64_t t2 = 0ull;
+    uint32_t i;
+    const OW_KDB_CALL_ATTR *attr;
+
+    /* main.log: bounded attributed request, no response payload. */
+    memset(response, 0xA5, sizeof(response));
+    len = 99u;
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_LOG, msg, 8u,
+                         response, sizeof(response), &len);
+    check_eq("main.log accepts a bounded message", (unsigned long)st,
+             (unsigned long)OW_SUCCESS);
+    check_eq("main.log returns zero-length response", (unsigned long)len, 0ul);
+
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_LOG, (const void *)0, 0u,
+                         response, sizeof(response), &len);
+    check_eq("main.log accepts an empty message", (unsigned long)st,
+             (unsigned long)OW_SUCCESS);
+
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_LOG, msg, 1u,
+                         response, sizeof(response), &len);
+    check_eq("main.log accepts a one-byte message", (unsigned long)st,
+             (unsigned long)OW_SUCCESS);
+
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_LOG, msg, 8u,
+                         response, sizeof(response), &len);
+    check_eq("main.log accepts a repeated call", (unsigned long)st,
+             (unsigned long)OW_SUCCESS);
+    attr = OwKdbBridgeGetCallAttr();
+    check_eq("log attribution is cleared after success",
+             (unsigned long)attr->CallerAssociationId, 0ul);
+    check_eq("log target attribution is cleared after success",
+             (unsigned long)attr->TargetInstanceId, 0ul);
+
+    /* Message bytes are data, not a format string: '%' sequences must appear
+     * verbatim in the captured UART output rather than being interpreted. */
+    {
+      static const uint8_t pct[] = "%s%s%n%d%x";
+      size_t lines_before = count_occ(HostHalOutput(), "[KDB][LOG]");
+
+      st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_LOG, pct,
+                           (uint32_t)(sizeof(pct) - 1u), response,
+                           sizeof(response), &len);
+      check_eq("main.log accepts percent-laden data", (unsigned long)st,
+               (unsigned long)OW_SUCCESS);
+      check_eq("main.log emits exactly one attributed line",
+               (unsigned long)(count_occ(HostHalOutput(), "[KDB][LOG]") -
+                               lines_before), 1ul);
+      check_window("main.log treats request bytes as data, not a format",
+                   count_occ(HostHalOutput(), "%s%s%n%d%x") >= 1, true);
+
+      /* A rejected call must also leave no in-progress attribution behind. */
+      st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_LOG, maxmsg, 129u,
+                           response, sizeof(response), &len);
+      check_eq("main.log oversized call still refused", (unsigned long)st,
+               (unsigned long)OW_ERR_INVALID_PARAM);
+      attr = OwKdbBridgeGetCallAttr();
+      check_eq("log attribution is cleared after failure",
+               (unsigned long)attr->CallerAssociationId, 0ul);
+      check_eq("log target attribution is cleared after failure",
+               (unsigned long)attr->TargetInstanceId, 0ul);
+    }
+
+    st = OwKdbBridgeCall(demo_app, 0xFFFFu, OW_KDB_SERVICE_LOG, msg, 8u,
+                         response, sizeof(response), &len);
+    check_eq("main.log refuses an unknown target instance",
+             (unsigned long)st, (unsigned long)OW_ERR_NOT_FOUND);
+
+    for (i = 0u; i < 128u; ++i) { maxmsg[i] = (uint8_t)('A' + (i % 26u)); }
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_LOG, maxmsg, 128u,
+                         response, sizeof(response), &len);
+    check_eq("main.log accepts maximum-length message", (unsigned long)st,
+             (unsigned long)OW_SUCCESS);
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_LOG, maxmsg, 129u,
+                         response, sizeof(response), &len);
+    check_eq("main.log refuses oversized request", (unsigned long)st,
+             (unsigned long)OW_ERR_INVALID_PARAM);
+
+    st = OwKdbBridgeCall(nocap_app, 0u, OW_KDB_SERVICE_LOG, msg, 8u,
+                         response, sizeof(response), &len);
+    check_eq("main.log enforces CAP_CALL", (unsigned long)st,
+             (unsigned long)OW_ERR_INSUFFICIENT);
+    st = OwKdbBridgeCall(30u, 0u, OW_KDB_SERVICE_LOG, msg, 8u,
+                         response, sizeof(response), &len);
+    check_eq("main.log refuses unknown caller association", (unsigned long)st,
+             (unsigned long)OW_ERR_NOT_FOUND);
+
+    /* main.runtime_info: request empty, response 8-byte little-endian uptime. */
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_RUNTIME_INFO,
+                         (const void *)0, 0u, response, sizeof(response), &len);
+    check_eq("main.runtime_info succeeds", (unsigned long)st,
+             (unsigned long)OW_SUCCESS);
+    check_eq("main.runtime_info returns 8 bytes", (unsigned long)len, 8ul);
+    for (i = 0u; i < 8u; ++i) {
+      t1 |= ((uint64_t)response[i] << (i * 8u));
+    }
+
+    OwHalDelayMs(5u);
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_RUNTIME_INFO,
+                         (const void *)0, 0u, response, sizeof(response), &len);
+    check_eq("main.runtime_info succeeds on repeat", (unsigned long)st,
+             (unsigned long)OW_SUCCESS);
+    for (i = 0u; i < 8u; ++i) {
+      t2 |= ((uint64_t)response[i] << (i * 8u));
+    }
+    check_window("main.runtime_info uptime is monotonic non-decreasing",
+                 t2 >= t1, true);
+
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_RUNTIME_INFO,
+                         (const void *)0, 0u, small, sizeof(small), &len);
+    check_eq("main.runtime_info refuses insufficient response capacity",
+             (unsigned long)st, (unsigned long)OW_ERR_INSUFFICIENT);
+
+    /* Request bytes are unexpected for runtime_info (contract: empty request);
+     * bridge accepts payload up to service MaxRequest (0), so non-empty is refused. */
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_RUNTIME_INFO,
+                         msg, 1u, response, sizeof(response), &len);
+    check_eq("main.runtime_info refuses non-empty request", (unsigned long)st,
+             (unsigned long)OW_ERR_INVALID_PARAM);
+
+    st = OwKdbBridgeCall(nocap_app, 0u, OW_KDB_SERVICE_RUNTIME_INFO,
+                         (const void *)0, 0u, response, sizeof(response), &len);
+    check_eq("main.runtime_info enforces CAP_CALL", (unsigned long)st,
+             (unsigned long)OW_ERR_INSUFFICIENT);
+    st = OwKdbBridgeCall(30u, 0u, OW_KDB_SERVICE_RUNTIME_INFO,
+                         (const void *)0, 0u, response, sizeof(response), &len);
+    check_eq("main.runtime_info refuses unknown caller association",
+             (unsigned long)st, (unsigned long)OW_ERR_NOT_FOUND);
+
+    st = OwKdbBridgeCall(demo_app, 0xFFFFu, OW_KDB_SERVICE_RUNTIME_INFO,
+                         (const void *)0, 0u, response, sizeof(response), &len);
+    check_eq("main.runtime_info refuses an unknown target instance",
+             (unsigned long)st, (unsigned long)OW_ERR_NOT_FOUND);
+
+    attr = OwKdbBridgeGetCallAttr();
+    check_eq("runtime_info attribution is cleared",
+             (unsigned long)attr->CallerAssociationId, 0ul);
+    check_eq("runtime_info target attribution is cleared",
+             (unsigned long)attr->TargetInstanceId, 0ul);
+
+    /* Attribution cleanup: successful main-kernel call after log/runtime calls
+     * must still behave correctly (no stale attribution/cross-call contamination). */
+    st = OwKdbBridgeCall(demo_app, 0u, OW_KDB_SERVICE_PING, (const void *)0, 0u,
+                         response, sizeof(response), &len);
+    check_eq("PING succeeds after log/runtime calls", (unsigned long)st,
+             (unsigned long)OW_SUCCESS);
+  }
+
+  /* ---- Service registration rules ---------------------------------- */
+  OwKdbGetStats(&stats);
+  check_eq("only the built-ins are registered so far",
+           (unsigned long)stats.Services, 4ul);
+  check_eq("a service without a name is refused",
+           (unsigned long)OwKdbServiceRegister(
+               0u, 0x4B44A100u, (const char *)0, OW_KDB_CAP_CALL, 0u, 0u,
+               kdb_test_echo_handler, (void *)0),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+  check_eq("a service without a handler is refused",
+           (unsigned long)OwKdbServiceRegister(
+               0u, 0x4B44A100u, "bad", OW_KDB_CAP_CALL, 0u, 0u,
+               (OW_KDB_SERVICE_HANDLER)0, (void *)0),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+  check_eq("a request bound above the bridge limit is refused",
+           (unsigned long)OwKdbServiceRegister(
+               0u, 0x4B44A100u, "bad", OW_KDB_CAP_CALL,
+               OW_KDB_BRIDGE_MAX_REQUEST + 1u, 0u, kdb_test_echo_handler,
+               (void *)0),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+  check_eq("a response bound above the bridge limit is refused",
+           (unsigned long)OwKdbServiceRegister(
+               0u, 0x4B44A100u, "bad", OW_KDB_CAP_CALL, 0u,
+               OW_KDB_BRIDGE_MAX_RESPONSE + 1u, kdb_test_echo_handler,
+               (void *)0),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+  check_eq("a service owned by an unknown instance is refused",
+           (unsigned long)OwKdbServiceRegister(
+               0xFFFFu, 0x4B44A100u, "bad", OW_KDB_CAP_CALL, 0u, 0u,
+               kdb_test_echo_handler, (void *)0),
+           (unsigned long)OW_ERR_NOT_FOUND);
+  check_eq("a duplicate main-kernel service id is refused",
+           (unsigned long)OwKdbServiceRegister(
+               0u, OW_KDB_SERVICE_PING, "dup", OW_KDB_CAP_CALL, 0u, 16u,
+               kdb_test_echo_handler, (void *)0),
+           (unsigned long)OW_ERR_ALREADY_EXISTS);
+
+  /* ---- Service Bridge: instance services and authorization --------- */
+  st = OwKdbServiceRegister(demo_inst, demo_service, "demo.echo",
+                            OW_KDB_CAP_CALL, 32u, 32u, kdb_test_echo_handler,
+                            (void *)0);
+  check_eq("a live instance can register a service", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+
+  st = OwKdbBridgeCall(demo_app, demo_inst, demo_service, request, 5u,
+                       response, sizeof(response), &len);
+  check_eq("the owning association can call its instance service",
+           (unsigned long)st, (unsigned long)OW_SUCCESS);
+  check_eq("the instance service mirrors the request", (unsigned long)len, 5ul);
+  check_bytes("the instance service returned the request bytes", response,
+              request, 5u);
+
+  st = OwKdbAssociateApplication("other-app", native_kernel, OW_KDB_CAP_CALL,
+                                 &other_app);
+  check_eq("a second application associates", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbBridgeCall(other_app, demo_inst, demo_service, request, 5u,
+                       response, sizeof(response), &len);
+  check_eq("a non-owner without CAP_ADMIN is refused", (unsigned long)st,
+           (unsigned long)OW_ERR_INSUFFICIENT);
+
+  st = OwKdbAssociateApplication(
+      "admin-app", native_kernel, OW_KDB_CAP_CALL | OW_KDB_CAP_ADMIN,
+      &admin_app);
+  check_eq("an admin-capable application associates", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbBridgeCall(admin_app, demo_inst, demo_service, request, 5u,
+                       response, sizeof(response), &len);
+  check_eq("CAP_ADMIN authorizes a cross-instance call", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+
+  st = OwKdbGetInstance(demo_inst, &inst);
+  check_eq("the instance bridge-call counter advanced", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("only authorized calls were counted",
+           (unsigned long)inst.BridgeCalls, 2ul);
+
+  /* ---- Handler failure and claimed-length validation ---------------- */
+  {
+    const OW_KDB_CALL_ATTR *attr;
+
+    st = OwKdbServiceRegister(demo_inst, 0x4B44A200u, "demo.fail",
+                              OW_KDB_CAP_CALL, 8u, 8u,
+                              kdb_test_fail_handler, (void *)0);
+    check_eq("a failing instance service registers", (unsigned long)st,
+             (unsigned long)OW_SUCCESS);
+    len = 77u;
+    memset(response, 0xA5, sizeof(response));
+    st = OwKdbBridgeCall(demo_app, demo_inst, 0x4B44A200u, request, 5u,
+                         response, sizeof(response), &len);
+    check_eq("handler failure propagates through the bridge", (unsigned long)st,
+             (unsigned long)OW_ERR_IO);
+    check_eq("a failed handler returns no bytes", (unsigned long)len, 0ul);
+    attr = OwKdbBridgeGetCallAttr();
+    check_eq("attribution is cleared after handler failure",
+             (unsigned long)attr->CallerAssociationId, 0ul);
+    check_eq("target attribution is cleared after handler failure",
+             (unsigned long)attr->TargetInstanceId, 0ul);
+
+    st = OwKdbServiceRegister(demo_inst, 0x4B44A201u, "demo.overrun",
+                              OW_KDB_CAP_CALL, 8u, 8u,
+                              kdb_test_overrun_handler, (void *)0);
+    check_eq("an over-claiming instance service registers",
+             (unsigned long)st, (unsigned long)OW_SUCCESS);
+    len = 77u;
+    memset(response, 0xA5, sizeof(response));
+    st = OwKdbBridgeCall(demo_app, demo_inst, 0x4B44A201u, request, 5u,
+                         response, sizeof(response), &len);
+    check_eq("a handler cannot claim more than its capacity",
+             (unsigned long)st, (unsigned long)OW_ERR_INSUFFICIENT);
+    check_eq("rejected overrun reports no bytes", (unsigned long)len, 0ul);
+    check_eq("rejected overrun copies nothing back",
+             (unsigned long)response[0], 0xA5ul);
+
+    check_eq("the failing service unregisters",
+             (unsigned long)OwKdbServiceUnregister(demo_inst, 0x4B44A200u),
+             (unsigned long)OW_SUCCESS);
+    check_eq("the over-claiming service unregisters",
+             (unsigned long)OwKdbServiceUnregister(demo_inst, 0x4B44A201u),
+             (unsigned long)OW_SUCCESS);
+  }
+
+  check_eq("stopping the instance before the next call succeeds",
+           (unsigned long)OwKdbStopInstance(demo_inst),
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbBridgeCall(demo_app, demo_inst, demo_service, request, 5u,
+                       response, sizeof(response), &len);
+  check_eq("a STOPPED instance does not serve the bridge", (unsigned long)st,
+           (unsigned long)OW_ERR_NOT_INITIALIZED);
+  check_eq("restarting the instance succeeds",
+           (unsigned long)OwKdbStartInstance(demo_inst),
+           (unsigned long)OW_SUCCESS);
+
+  st = OwKdbBridgeCall(demo_app, 0xFFFFu, demo_service, request, 5u, response,
+                       sizeof(response), &len);
+  check_eq("an unknown target instance is refused", (unsigned long)st,
+           (unsigned long)OW_ERR_NOT_FOUND);
+
+  check_eq("an instance service can be unregistered",
+           (unsigned long)OwKdbServiceUnregister(demo_inst, demo_service),
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbBridgeCall(demo_app, demo_inst, demo_service, request, 5u,
+                       response, sizeof(response), &len);
+  check_eq("an unregistered instance service is not found",
+           (unsigned long)st, (unsigned long)OW_ERR_NOT_FOUND);
+  check_eq("unregistering an unknown service is refused",
+           (unsigned long)OwKdbServiceUnregister(demo_inst, demo_service),
+           (unsigned long)OW_ERR_NOT_FOUND);
+
+  /* ---- Fault cleanup ----------------------------------------------- */
+  st = OwKdbServiceRegister(demo_inst, demo_service, "demo.echo",
+                            OW_KDB_CAP_CALL, 32u, 32u, kdb_test_echo_handler,
+                            (void *)0);
+  check_eq("the instance re-registers a service before the fault",
+           (unsigned long)st, (unsigned long)OW_SUCCESS);
+  OwKdbGetStats(&stats);
+  services_before = stats.Services;
+  check_eq("the service is counted before the fault",
+           (unsigned long)services_before, 5ul);
+
+  check_eq("faulting an instance succeeds",
+           (unsigned long)OwKdbFaultInstance(demo_inst, OW_ERR_CORRUPT),
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbGetInstance(demo_inst, &inst);
+  check_eq("a faulted instance remains inspectable", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("the faulted instance is FAULTED", (unsigned long)inst.State,
+           (unsigned long)OW_KDB_INSTANCE_FAULTED);
+  check_eq("the page charge is released on fault",
+           (unsigned long)inst.ResidentPages, 0ul);
+  check_eq("the fault status is recorded", (unsigned long)inst.LastFault,
+           (unsigned long)OW_ERR_CORRUPT);
+
+  OwKdbGetStats(&stats);
+  check_eq("fault cleanup unregisters the instance's services",
+           (unsigned long)(services_before - stats.Services), 1ul);
+  check_eq("faulting an already faulted instance is refused",
+           (unsigned long)OwKdbFaultInstance(demo_inst, OW_ERR_CORRUPT),
+           (unsigned long)OW_ERR_ALREADY_EXISTS);
+  check_eq("a faulted instance cannot be started",
+           (unsigned long)OwKdbStartInstance(demo_inst),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+
+  st = OwKdbGetAssociation(demo_app, &assoc);
+  check_eq("fault cleanup leaves the association intact", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_window("fault cleanup clears the association link",
+               assoc.InstanceId == OW_KDB_INVALID_ID, true);
+
+  check_eq("destroying a faulted instance succeeds",
+           (unsigned long)OwKdbDestroyInstance(demo_inst),
+           (unsigned long)OW_SUCCESS);
+  check_eq("the destroyed instance is gone",
+           (unsigned long)OwKdbGetInstance(demo_inst, &inst),
+           (unsigned long)OW_ERR_NOT_FOUND);
+  check_eq("disassociating after destruction succeeds",
+           (unsigned long)OwKdbDisassociateApplication(demo_app),
+           (unsigned long)OW_SUCCESS);
+
+  /* ---- Sweep end-to-end with a real OWX fixture -------------------- */
+  check_eq("attaching a null Sweep image is refused",
+           (unsigned long)OwKdbAttachSweepImage((const uint8_t *)0, 0u),
+           (unsigned long)OW_ERR_INVALID_PARAM);
+  st = OwKdbAttachSweepImage(g_owinit_image, OWINIT_IMAGE_SIZE);
+  check_eq("a real OWX image attaches to Sweep", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+
+  st = OwKdbGetKernel(sweep_kernel, &out);
+  check_eq("the Sweep descriptor is still queryable", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_window("attaching an image clears DECLARATIVE",
+               (out.Flags & OW_KDB_DESC_DECLARATIVE) == 0u, true);
+  check_window("the Sweep descriptor now carries the image",
+               out.Image == g_owinit_image &&
+                   out.ImageSize == OWINIT_IMAGE_SIZE,
+               true);
+  st = OwKdbLoaderValidate(&out, &pages);
+  check_eq("the attached Sweep image validates as OWX", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("the attached image charges the same pages",
+           (unsigned long)pages, (unsigned long)expected_pages);
+
+  st = OwKdbAssociateApplication(
+      "sweep-live", sweep_kernel,
+      OW_KDB_CAP_CALL | OW_KDB_CAP_REGISTER_SERVICE, &sweep_live);
+  check_eq("a live Sweep application associates", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbLoadInstance(sweep_live, 8u, &sweep_inst);
+  check_eq("Sweep loads through the same lifecycle", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbGetInstance(sweep_inst, &inst);
+  check_eq("Sweep is READY after load", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_eq("Sweep is READY", (unsigned long)inst.State,
+           (unsigned long)OW_KDB_INSTANCE_READY);
+  check_eq("Sweep records the Sweep kernel", (unsigned long)inst.KernelId,
+           (unsigned long)sweep_kernel);
+  check_eq("Sweep starts", (unsigned long)OwKdbStartInstance(sweep_inst),
+           (unsigned long)OW_SUCCESS);
+
+  st = OwKdbServiceRegister(sweep_inst, sweep_service, "sweep.echo",
+                            OW_KDB_CAP_CALL, 32u, 32u, kdb_test_echo_handler,
+                            (void *)0);
+  check_eq("Sweep registers its bridge service", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  st = OwKdbBridgeCall(sweep_live, sweep_inst, sweep_service, request, 5u,
+                       response, sizeof(response), &len);
+  check_eq("Sweep serves a bridge request", (unsigned long)st,
+           (unsigned long)OW_SUCCESS);
+  check_bytes("Sweep echoes the request", response, request, 5u);
+
+  check_eq("faulting Sweep releases it",
+           (unsigned long)OwKdbFaultInstance(sweep_inst, OW_ERR_CORRUPT),
+           (unsigned long)OW_SUCCESS);
+  check_eq("the faulted Sweep instance is destroyed",
+           (unsigned long)OwKdbDestroyInstance(sweep_inst),
+           (unsigned long)OW_SUCCESS);
+  check_eq("the Sweep application can be disassociated",
+           (unsigned long)OwKdbDisassociateApplication(sweep_live),
+           (unsigned long)OW_SUCCESS);
+
+  /* ---- Executor seam: attribution and rollback (R5) ------------------ */
+  {
+    uint32_t live_a = OW_KDB_INVALID_ID;
+    uint32_t live_b = OW_KDB_INVALID_ID;
+    uint32_t live_c = OW_KDB_INVALID_ID;
+    uint32_t inst_a = OW_KDB_INVALID_ID;
+    uint32_t inst_b = OW_KDB_INVALID_ID;
+    uint32_t inst_c = OW_KDB_INVALID_ID;
+
+    /* A registered stub is reported available; the plan still validates. */
+    check_eq("a stub executor registers",
+             (unsigned long)OwKdbRegisterExecutor(kdb_test_stub_backend,
+                                                  (void *)0),
+             (unsigned long)OW_SUCCESS);
+    check_window("an executor becomes available",
+                 OwKdbExecutionAvailable(), true);
+    st = OwKdbAssociateApplication("exec-a", sweep_kernel, OW_KDB_CAP_CALL,
+                                   &live_a);
+    check_eq("a first executor-test application associates",
+             (unsigned long)st, (unsigned long)OW_SUCCESS);
+    st = OwKdbLoadInstance(live_a, 8u, &inst_a);
+    check_eq("it loads", (unsigned long)st, (unsigned long)OW_SUCCESS);
+
+    /* Unregister: plan validation succeeds, execution is refused without
+     * touching instance state. */
+    OwKdbUnregisterExecutor();
+    check_window("no executor is reported available",
+                 !OwKdbExecutionAvailable(), true);
+    st = OwKdbExecuteInstance(inst_a);
+    check_eq("execution without a backend is UNSUPPORTED",
+             (unsigned long)st, (unsigned long)OW_ERR_UNSUPPORTED);
+    st = OwKdbGetInstance(inst_a, &inst);
+    check_eq("an unexecuted instance stays READY", (unsigned long)inst.State,
+             (unsigned long)OW_KDB_INSTANCE_READY);
+    check_window("no execution was started", inst.ExecutionStarted, false);
+    check_eq("no KDB binding was created",
+             (unsigned long)OwKdbExecPsBindingCount(), 0ul);
+
+    /* Stub backend: accepts the validated plan, yet state stays READY. */
+    check_eq("the stub executor registers again",
+             (unsigned long)OwKdbRegisterExecutor(kdb_test_stub_backend,
+                                                  (void *)0),
+             (unsigned long)OW_SUCCESS);
+    check_window("the executor seam is available again",
+                 OwKdbExecutionAvailable(), true);
+    g_stub_calls = 0;
+    g_stub_fail = 0;
+    st = OwKdbExecuteInstance(inst_a);
+    check_eq("a stub backend accepts the validated plan",
+             (unsigned long)st, (unsigned long)OW_SUCCESS);
+    check_eq("the stub backend was invoked", (unsigned long)g_stub_calls, 1ul);
+    st = OwKdbGetInstance(inst_a, &inst);
+    check_eq("a plan handoff is not an execution: it stays READY",
+             (unsigned long)inst.State, (unsigned long)OW_KDB_INSTANCE_READY);
+    check_window("a handoff is not an execution: ExecutionStarted stays false",
+                 inst.ExecutionStarted, false);
+    check_window("the real PS backend is not exercised by the stub",
+                 inst.ProcessId == 0u && inst.ThreadId == 0u, true);
+    check_eq("no KDB binding was created",
+             (unsigned long)OwKdbExecPsBindingCount(), 0ul);
+
+    /* Stub backend failure: the instance faults through the normal path. */
+    st = OwKdbAssociateApplication("exec-b", sweep_kernel, OW_KDB_CAP_CALL,
+                                   &live_b);
+    check_eq("a second executor-test application associates",
+             (unsigned long)st, (unsigned long)OW_SUCCESS);
+    st = OwKdbLoadInstance(live_b, 8u, &inst_b);
+    check_eq("it loads", (unsigned long)st, (unsigned long)OW_SUCCESS);
+    g_stub_calls = 0;
+    g_stub_fail = 1;
+    st = OwKdbExecuteInstance(inst_b);
+    check_eq("a failing stub backend returns its error",
+             (unsigned long)st, (unsigned long)OW_ERR_IO);
+    check_eq("the stub backend was invoked", (unsigned long)g_stub_calls, 1ul);
+    st = OwKdbGetInstance(inst_b, &inst);
+    check_eq("a failing backend faults the instance",
+             (unsigned long)inst.State, (unsigned long)OW_KDB_INSTANCE_FAULTED);
+    check_eq("the fault is attributed to the instance",
+             (unsigned long)inst.LastFault, (unsigned long)OW_ERR_IO);
+    check_eq("a failed stub still created no KDB binding",
+             (unsigned long)OwKdbExecPsBindingCount(), 0ul);
+
+    /* Real PS backend in the host harness: the attached Sweep image is
+     * unsigned, so CIS refuses it and the backend faults the instance.
+     * Either way the outcome must be attributed and must not be RUNNING. */
+    check_eq("the real PS executor registers",
+             (unsigned long)OwKdbExecPsInitialize(), (unsigned long)OW_SUCCESS);
+    check_window("the real executor seam is available",
+                 OwKdbExecutionAvailable(), true);
+    st = OwKdbAssociateApplication("exec-c", sweep_kernel, OW_KDB_CAP_CALL,
+                                   &live_c);
+    check_eq("a third executor-test application associates",
+             (unsigned long)st, (unsigned long)OW_SUCCESS);
+    st = OwKdbLoadInstance(live_c, 8u, &inst_c);
+    check_eq("it loads", (unsigned long)st, (unsigned long)OW_SUCCESS);
+    st = OwKdbExecuteInstance(inst_c);
+    if (st == OW_SUCCESS) {
+      /* The image happened to be trusted in this build: the instance must
+       * still not be RUNNING until a dispatch event occurs. */
+      st = OwKdbGetInstance(inst_c, &inst);
+      check_window("a prepared instance is not RUNNING before dispatch",
+                   inst.State == OW_KDB_INSTANCE_READY, true);
+    } else {
+      st = OwKdbGetInstance(inst_c, &inst);
+      check_eq("an unverifiable image faults the instance instead of running",
+               (unsigned long)inst.State,
+               (unsigned long)OW_KDB_INSTANCE_FAULTED);
+      check_window("the fault carries a CIS refusal status",
+                   ow_status_error(inst.LastFault), true);
+    }
+    check_eq("no KDB binding survives an unexecuted image",
+             (unsigned long)OwKdbExecPsBindingCount(), 0ul);
+
+    /* The real backend remains installed for the rest of the suite. */
+    check_window("the real PS executor remains installed",
+                 OwKdbExecutionAvailable(), true);
+    g_stub_fail = 0;
+  }
+
+  /* ---- Aggregate accounting ---------------------------------------- */
+  OwKdbGetStats(&stats);
+  check_window("fault accounting recorded both lifecycle faults",
+               stats.Faults >= 2u, true);
+  check_window("bridge accounting advanced with the calls",
+               stats.BridgeCalls >= 6u, true);
+
+  printf("--- Kernel Dual Boot / KAPA verified\n");
+}
+
+/* ------------------------------------------------------------------------- */
+/* Main                                                                       */
+/* ------------------------------------------------------------------------- */
+
+int main(int argc, char **argv) {
+  OW_STATUS st;
+
+  /* Sub-suite tallies.  The CIS suites keep their own counters so a mismatch
+   * between a sub-suite and the suite total stays visible; these collect them so
+   * the final RESULT line counts every assertion that ran, not only the ones
+   * made directly in main().  Reporting 406 passes while 600 ran would be a
+   * number that looks like coverage and is not. */
+  int sub_passed = 0;
+
+  printf("=== OpenWindows kernel host boot harness ===\n");
+
+  fflush(stdout);
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 1: HAL                                                       */
+  /* ------------------------------------------------------------------ */
+
+  st = OwHalInitialize();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] HAL failed\n");
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 2: Memory Manager                                            */
+  /* ------------------------------------------------------------------ */
+
+  st = OwMemInitialize();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] Memory init failed\n");
+    return 1;
+  }
+
+  (void)OwMemAllocatePage();
+
+  /* Allocator hardening: impossible sizes are refused before any arithmetic,
+   * so a failed request can never wrap around to a small "successful" block. */
+  check_window("kalloc refuses an impossible size",
+               kalloc((size_t)-1) == NULL, true);
+  check_window("kcalloc refuses a multiplying overflow",
+               kcalloc((size_t)-1, 2u) == NULL, true);
+  {
+    void *block = kalloc(16u);
+    check_window("krealloc leaves the old block intact when the new size is "
+                 "refused",
+                 block != NULL && krealloc(block, (size_t)-1) == NULL, true);
+  }
+  check_window("the page allocator refuses a wrapped page span",
+               OwMemAllocatePages(0xFFFFFFFFu) == (uint64_t)0, true);
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 3: Object Manager                                            */
+  /* ------------------------------------------------------------------ */
+
+  st = OwObjInitialize();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] Object init failed\n");
+    return 1;
+  }
+
+  (void)OwObjCreateDirectory("\\", (void *)0);
+  (void)OwObjCreateDirectory("Device", (void *)0);
+  (void)OwObjCreateDirectory("DosDevices", (void *)0);
+  (void)OwObjCreateDirectory("Kernel", (void *)0);
+  (void)OwObjCreateDirectory("Drivers", (void *)0);
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 4: Diagnostic Engine + ALPC                                  */
+  /* ------------------------------------------------------------------ */
+
+  st = OwDiagInitialize();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] Diag init failed\n");
+    return 1;
+  }
+
+  st = OwAlpcInitialize();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] ALPC init failed\n");
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Runlevel subsystem                                                 */
+  /* ------------------------------------------------------------------ */
+
+  st = OwRunlevelInitialize(OW_RUNLEVEL_BOOT_DEFAULT);
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] Runlevel init failed\n");
+    return 1;
+  }
+
+  ow_kprintf("[RUNLVL] boot target: %d (%s) - "
+             "runlevel subsystem online\r\n",
+             OwRunlevelGetTarget(), OwRunlevelName(OwRunlevelGetTarget()));
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 4b: SUCS + SUTF                                              */
+  /* ------------------------------------------------------------------ */
+
+  OwSucsInitialize();
+  (void)OwSucsCommitBoot();
+
+  if (OwSucsSelfTest()) {
+
+    ow_kprintf("[SUTF] Codec self-test: OK "
+               "(Base SUCS / SUTF-8 active)\r\n");
+
+  } else {
+
+    printf("[BOOT] SUTF self-test failed\n");
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 4c: Process / Thread subsystem                               */
+  /* ------------------------------------------------------------------ */
+
+  st = OwPsInitialize();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] PS init failed\n");
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 4d: Kernel Dual Boot (KDB) / KAPA                            */
+  /* ------------------------------------------------------------------ */
+
+  st = OwKdbInitialize();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] KDB init failed\n");
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Copyleft Integrity Safeguard                                        */
+  /* ------------------------------------------------------------------ */
+  /* Placed where the kernel arms it: after the process subsystem and before
+   * anything can map an executable. */
+
+  st = OwCisInitialize();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] CIS init failed\n");
+    return 1;
+  }
+
+  ow_kprintf("[CIS] enforcement armed (signatures mandatory)\r\n");
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 5: VFS                                                       */
+  /* ------------------------------------------------------------------ */
+
+  st = OwVfsMountPrimary();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] VFS primary failed\n");
+    return 1;
+  }
+
+  st = OwVfsMountSecure();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] VFS secure failed\n");
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 5b: Physical storage                                         */
+  /* ------------------------------------------------------------------ */
+
+  st = OwDiskInitialize();
+
+  if (!ow_status_success(st)) {
+    printf("[BOOT] OwDiskInitialize failed\n");
+    return 1;
+  }
+
+  /* The volume is mounted now, so the OWFS permission checks can be exercised on
+   * real inodes rather than argued about.  Placed before owinit is provisioned so
+   * the fixture files cannot be confused with a boot artifact. */
+  test_owfs_read_permissions();
+
+  /* ------------------------------------------------------------------ */
+  /* Kernel provenance policy (absence handling)                        */
+  /* ------------------------------------------------------------------ */
+  /* The freshly formatted volume carries no openwinkrnl.owx yet.  The two
+   * outcomes that must never be conflated are pinned here: a development
+   * policy tolerates absence but reports it as NOT verified, and a production
+   * policy refuses absence outright.  Neither may return OW_SUCCESS, so a
+   * missing kernel image can never be laundered into a passing check. */
+  {
+    const OW_CIS_POLICY *kpol = OwCisPolicy();
+    bool saved = (kpol != NULL) ? kpol->RequireKernelImage : false;
+    OW_STATUS rst;
+
+    ow_kprintf("[STARTED] Kernel Provenance Policy\r\n");
+
+    (void)OwCisSetRequireKernelImage(false);
+    rst = OwSentinelVerifyKernelProvenanceFromVolume();
+    check_eq("development policy: absent kernel image is skipped, not verified",
+             (unsigned long)rst, (unsigned long)OW_WRN_NOT_VERIFIED);
+    check_window("development policy: skipped is not a claimed success",
+                 ow_status_success(rst), false);
+
+    (void)OwCisSetRequireKernelImage(true);
+    rst = OwSentinelVerifyKernelProvenanceFromVolume();
+    check_eq("production policy: absent kernel image is refused",
+             (unsigned long)rst, (unsigned long)OW_ERR_NOT_FOUND);
+    check_window("production policy: refusal is never a success",
+                 ow_status_success(rst), false);
+
+    (void)OwCisSetRequireKernelImage(saved);
+    ow_kprintf("[FINISHED] Kernel Provenance Policy\r\n");
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Provision owinit.owx                                               */
+  /* ------------------------------------------------------------------ */
+
+  {
+    uint32_t ino = 0;
+
+    st = OwFsOwfsCreate(OW_INIT_EXEC_NAME, &ino);
+
+    if (!ow_status_success(st)) {
+      printf("[BOOT] owinit create failed\n");
+      return 1;
+    }
+
+    st = OwFsOwfsWrite(OW_INIT_EXEC_NAME, g_owinit_image, OWINIT_IMAGE_SIZE);
+
+    if (!ow_status_success(st)) {
+      printf("[BOOT] owinit write failed\n");
+      return 1;
+    }
+
+    printf("[BOOT] provisioned %s on host OWFS "
+           "(ino %u)\n",
+           OW_INIT_EXEC_NAME, (unsigned)ino);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 5c: owinit provisioning check                                */
+  /* ------------------------------------------------------------------ */
+
+  ow_kprintf("[STARTED] owinit\r\n");
+
+  if (OwDiskOwinitPresent()) {
+
+    ow_kprintf("[FINISHED] owinit\r\n");
+
+  } else {
+
+    printf("[BOOT] owinit executable missing on host OWFS\n");
+
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 5c.5: owinit process hand-off                                */
+  /* ------------------------------------------------------------------ */
+
+  {
+    static uint8_t s_OwinitImage[64U * 1024U];
+
+    uint32_t read_len = 0;
+    OW_STATUS read_status;
+
+    read_status = OwFsOwfsRead(OW_INIT_EXEC_NAME, s_OwinitImage,
+                               (uint32_t)sizeof(s_OwinitImage), &read_len);
+
+    if (!ow_status_success(read_status) || read_len == 0) {
+
+      printf("[BOOT] owinit.owx read failed "
+             "(st=0x%x, len=%u)\n",
+             (unsigned)read_status, (unsigned)read_len);
+
+      return 1;
+    }
+
+    {
+      OW_PROCESS_OBJECT *process;
+
+      process = OwPsCreateProcess("owinit", OW_PS_PID_KERNEL);
+
+      if (process == NULL) {
+
+        printf("[BOOT] owinit process create failed\n");
+
+        return 1;
+      }
+
+      /* The outcome is asserted rather than assumed.
+       *
+       * A default build pins no trust anchors and its owinit.owx carries no
+       * signature, so this load is *supposed* to fail, and the suite passes when
+       * it does: refusing to boot is the working state, not a harness error.  A
+       * CIS_DEV_TRUST build has both an anchor and a signed image, so the same
+       * load is supposed to succeed.  Treating either outcome as the only
+       * correct one would have meant choosing which build gets a regression
+       * suite, and the wrong choice is the one that stops checking that unsigned
+       * code does not run.
+       *
+       * The thread is created only on success, so a refusal cannot be laundered
+       * into a running process by a later step. */
+      {
+        OW_STATUS load_status = OwPsLoadImage(process, s_OwinitImage, read_len,
+                                              (uint32_t)OW_CIS_RECORD_BOOT);
+        OW_CIS_VERDICT verdict = OwPsLastCisVerdict();
+
+        if (ow_status_success(load_status)) {
+          OW_THREAD_OBJECT *thread;
+
+          check_window("a trusted owinit image loads",
+                       verdict == OW_CIS_VERDICT_TRUSTED, true);
+
+          thread = OwPsCreateThread(process, process->EntryPoint, 0);
+
+          if (thread == NULL) {
+
+            printf("[BOOT] owinit thread create failed\n");
+
+            return 1;
+
+          }
+
+          printf("[BOOT] owinit enqueued as PID 1 "
+                 "thread %u\n",
+                 (unsigned)thread->Tid);
+        } else {
+          /* Refused.  Two properties make this a refusal rather than a load that
+           * stumbled: a CIS-specific status, and no executable state left
+           * behind. */
+          printf("[BOOT] owinit refused as configured "
+                 "(status 0x%08X, verdict %u)\n",
+                 (unsigned)load_status, (unsigned)verdict);
+
+          check_window("a refused image reports a CIS-specific status",
+                       (load_status & OW_ERR_CIS_FAMILY_MASK) != 0u, true);
+          check_window("a refused image leaves no entry point",
+                       process->EntryPoint == 0u, true);
+
+#ifdef CIS_DEV_TRUST
+          /* With the anchor present, a refusal means the opt-in build cannot
+           * boot.  Asserting it here names the cause where it happens rather
+           * than leaving a confusing failure further on. */
+          check_window("a CIS_DEV_TRUST build accepts its own signed owinit",
+                       verdict == OW_CIS_VERDICT_TRUSTED, true);
+#else
+          check_window("a build with no anchors reports UNSIGNED",
+                       verdict == OW_CIS_VERDICT_REJECT_UNSIGNED, true);
+#endif
+        }
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Provision openwinkrnl.chk                                          */
+  /* ------------------------------------------------------------------ */
+
+  {
+    static const char kDefaultChecksum[] =
+        "e925ab4e3f175405000000000000000000000000000000000000000000000000\n";
+
+    uint8_t checksum_buffer[256];
+    uint32_t checksum_inode = 0;
+    long checksum_length;
+
+    checksum_length = host_read_file_candidates(
+        "openwinkrnl.chk", checksum_buffer, sizeof(checksum_buffer) - 1);
+
+    if (checksum_length < 0) {
+
+      /*
+       * No host checksum was found.
+       * Use the built-in test checksum.
+       */
+      if (!ow_strcopy((char *)checksum_buffer, sizeof(checksum_buffer),
+                      kDefaultChecksum)) {
+
+        printf("[BOOT] default checksum copy failed\n");
+
+        return 1;
+      }
+
+      checksum_length = (long)ow_strlen((const char *)checksum_buffer);
+
+    } else {
+
+      checksum_buffer[checksum_length] = '\0';
+    }
+
+    st = OwFsOwfsCreate(OW_KERNEL_CHK_NAME, &checksum_inode);
+
+    if (!ow_status_success(st)) {
+
+      printf("[BOOT] openwinkrnl.chk create failed\n");
+
+      return 1;
+    }
+
+    st = OwFsOwfsWrite(OW_KERNEL_CHK_NAME, checksum_buffer,
+                       (uint32_t)checksum_length);
+
+    if (!ow_status_success(st)) {
+
+      printf("[BOOT] openwinkrnl.chk write failed\n");
+
+      return 1;
+    }
+
+    printf("[BOOT] provisioned %s on host OWFS "
+           "(ino %u, len %u)\n",
+           OW_KERNEL_CHK_NAME, (unsigned)checksum_inode,
+           (unsigned)checksum_length);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Provision openwinkrnl.owx                                          */
+  /* ------------------------------------------------------------------ */
+
+  {
+    /*
+     * Static storage intentionally replaces malloc/free.
+     *
+     * Sized past the current full-kernel artifact (1,646,592 B in R3).  A
+     * buffer smaller than the image makes host_read_file truncate at the
+     * capacity boundary, which the checksum phase then reports as a corrupt
+     * kernel and BANhammer halts the harness forever -- exactly the R3
+     * "hosttest did not finish" failure.  Keep this comfortably above the
+     * image size, and never let a partial read look like a whole image.
+     */
+    static uint8_t kernel_image[4U * 1024U * 1024U];
+
+    uint32_t kernel_inode = 0;
+    long kernel_size;
+
+    kernel_size = host_read_file_candidates("openwinkrnl.owx", kernel_image,
+                                            sizeof(kernel_image));
+
+    /* A read that fills the buffer is indistinguishable from a truncated read
+     * of a larger file, because host_read_file stops at capacity.  Refuse it
+     * explicitly instead of provisioning a partial image that the checksum
+     * phase would blame on the kernel. */
+    if (kernel_size > 0 && (size_t)kernel_size >= sizeof(kernel_image)) {
+      printf("[BOOT] openwinkrnl.owx is larger than the hosttest buffer "
+             "(%u bytes); refusing truncated image\n",
+             (unsigned)sizeof(kernel_image));
+      return 1;
+    }
+
+    if (kernel_size > 0) {
+
+      st = OwFsOwfsCreate(OW_KERNEL_IMG_NAME, &kernel_inode);
+
+      if (!ow_status_success(st)) {
+
+        printf("[BOOT] %s create failed\n", OW_KERNEL_IMG_NAME);
+
+        return 1;
+      }
+
+      st = OwFsOwfsWrite(OW_KERNEL_IMG_NAME, kernel_image,
+                         (uint32_t)kernel_size);
+
+      if (!ow_status_success(st)) {
+
+        printf("[BOOT] %s write failed\n", OW_KERNEL_IMG_NAME);
+
+        return 1;
+      }
+
+      printf("[BOOT] provisioned %s on host OWFS "
+             "(ino %u, size %ld)\n",
+             OW_KERNEL_IMG_NAME, (unsigned)kernel_inode, kernel_size);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 5d: Kernel integrity                                         */
+  /* ------------------------------------------------------------------ */
+
+  ow_kprintf("[STARTED] Kernel Integrity\r\n");
+
+  st = OwSentinelVerifyKernelChecksum();
+
+  if (ow_status_success(st)) {
+
+    ow_kprintf("[FINISHED] Kernel Integrity\r\n");
+
+  } else {
+
+    printf("[BOOT] Kernel integrity check failed (0x%X)\n", (unsigned)st);
+
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 6: Network Router                                            */
+  /* ------------------------------------------------------------------ */
+
+  st = OwNetInitialize();
+
+  if (!ow_status_success(st)) {
+
+    printf("[BOOT] Net init failed\n");
+
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 6b: UniVIP + FVIP                                            */
+  /* ------------------------------------------------------------------ */
+
+  if (!OwVipIsUp()) {
+
+    uint32_t vip_code;
+
+    vip_code = OwVipInitialize();
+
+    if (!OwVipIsSuccessCode(vip_code)) {
+
+      printf("[BOOT] VIP init failed (0x%X)\n", (unsigned)vip_code);
+
+      return 1;
+    }
+  }
+
+  if (OwVipIsUp()) {
+
+    ow_kprintf("[VIP] UniVIP online: root volume %u @ LBA %llu, "
+               "FVIP index ready\r\n",
+               OW_VIP_ROOT_VOLUME, (unsigned long long)OW_VIP_ROOT_BASE_SECTOR);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 7: Sentinel                                                  */
+  /* ------------------------------------------------------------------ */
+
+  st = OwSentinelInitialize();
+
+  if (!ow_status_success(st)) {
+
+    printf("[BOOT] Sentinel init failed\n");
+
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 8: Syscall gateway                                           */
+  /* ------------------------------------------------------------------ */
+
+  st = OwSyscallInitialize();
+
+  if (!ow_status_success(st)) {
+
+    printf("[BOOT] Syscall init failed\n");
+
+    return 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 9: Scheduler hand-off                                        */
+  /* ------------------------------------------------------------------ */
+
+  OwPsCaptureBootContext();
+  OwPsStartScheduler();
+
+  /* ------------------------------------------------------------------ */
+  /* Phase 9: Debug shell                                                */
+  /* ------------------------------------------------------------------ */
+
+  st = OwShellInitialize();
+
+  if (!ow_status_success(st)) {
+
+    printf("[BOOT] Shell init failed\n");
+
+    return 1;
+  }
+
+  /*
+   * Build the optional custom shell command without snprintf.
+   *
+   * argc == 1:
+   *     exit
+   *
+   * argc == 2:
+   *     argv[1]
+   *     exit
+   *
+   * argc >= 3:
+   *     argv[1] argv[2]
+   *     exit
+   */
+  if (argc > 1) {
+
+    static char custom_script[256];
+
+    size_t position = 0;
+    size_t i;
+
+    /* First argument. */
+    for (i = 0; argv[1][i] != '\0' && position + 1 < sizeof(custom_script);
+         ++i) {
+
+      custom_script[position++] = argv[1][i];
+    }
+
+    /* Optional second argument. */
+    if (argc > 2 && position + 1 < sizeof(custom_script)) {
+
+      custom_script[position++] = ' ';
+
+      for (i = 0; argv[2][i] != '\0' && position + 1 < sizeof(custom_script);
+           ++i) {
+
+        custom_script[position++] = argv[2][i];
+      }
+    }
+
+    /* Newline after command. */
+    if (position + 1 < sizeof(custom_script))
+      custom_script[position++] = '\n';
+
+    /* "exit\n" */
+    if (position + 5 < sizeof(custom_script)) {
+
+      custom_script[position++] = 'e';
+      custom_script[position++] = 'x';
+      custom_script[position++] = 'i';
+      custom_script[position++] = 't';
+      custom_script[position++] = '\n';
+    }
+
+    custom_script[position] = '\0';
+
+    HostHalSetInputScript(custom_script);
+
+  } else {
+
+    HostHalSetInputScript(g_script);
+  }
+
+  (void)OwShellRun();
+
+  /* ------------------------------------------------------------------ */
+  /* User-window address validation (regression)                         */
+  /* ------------------------------------------------------------------ */
+
+  test_user_window_predicates();
+
+  /* ------------------------------------------------------------------ */
+  /* Import rejection (regression)                                       */
+  /* ------------------------------------------------------------------ */
+
+  test_import_rejection();
+
+  /* ------------------------------------------------------------------ */
+  /* Entry point identity (regression)                                  */
+  /* ------------------------------------------------------------------ */
+
+  test_entry_classifiers();
+  test_entry_is_owinit_main();
+
+  /* ------------------------------------------------------------------ */
+  /* Userspace boot policy and emergency image integrity                 */
+  /* ------------------------------------------------------------------ */
+
+  test_userspace_states();
+  test_emergency_images();
+
+  /* ------------------------------------------------------------------ */
+  /* Process-entry argc/argv delivery (layout + registers)               */
+  /* ------------------------------------------------------------------ */
+
+  test_argv_layout();
+  test_entry_arg_regs();
+
+  /* ------------------------------------------------------------------ */
+  /* kconfctl configuration core                                         */
+  /* ------------------------------------------------------------------ */
+
+  test_kconfctl_core();
+
+  /* ------------------------------------------------------------------ */
+  /* banhammer_cli panic-text core                                       */
+  /* ------------------------------------------------------------------ */
+
+  test_banhammer_cli_core();
+
+  /* ------------------------------------------------------------------ */
+  /* .bdmp crash-dump format                                             */
+  /* ------------------------------------------------------------------ */
+
+  test_bdmp_core();
+
+  /* ------------------------------------------------------------------ */
+  /* Testing-report regressions                                          */
+  /* ------------------------------------------------------------------ */
+
+  test_report_regressions();
+
+  /* ------------------------------------------------------------------ */
+  /* Kernel Dual Boot / KAPA                                             */
+  /* ------------------------------------------------------------------ */
+
+  test_kdb();
+
+  /* ------------------------------------------------------------------ */
+  /* Copyleft Integrity Safeguard                                        */
+  /* ------------------------------------------------------------------ */
+
+  test_cis_format();
+  test_cis_core();
+  g_failures += test_cis_verify_run(&sub_passed);
+  g_passed  += sub_passed;
+
+  /* ------------------------------------------------------------------ */
+  /* CIS at the loader boundary                                          */
+  /* ------------------------------------------------------------------ */
+
+  /* After the verifier suite, not beside it.  These loads need a live process
+   * table and a memory manager, and the harness has only finished standing those
+   * up by this point in the run.  Ordering them after the verifier tests also
+   * means the corpus has just been walked once, so a fixture the verifier
+   * already rejected is not being re-litigated here for a different reason. */
+  g_failures += test_cis_loader_run(&sub_passed);
+  g_passed  += sub_passed;
+
+  /* ------------------------------------------------------------------ */
+  /* SKTO name admission at the kernel boundary                          */
+  /* ------------------------------------------------------------------ */
+
+  /* The adapter the syscall gateway now calls.  Host-only: the containment
+   * callback runs against a real VAD tree, but no CPL3 transition happens in
+   * this harness, so this is not a Ring 3 syscall test. */
+  g_failures += test_skto_name_run(&sub_passed);
+  g_passed  += sub_passed;
+
+  /* SuperUnicode reference-library integration across character authority,
+   * filesystem naming, input, IPC, console, and conformance surfaces. */
+  g_failures += test_superunicode_run(&sub_passed);
+  g_passed  += sub_passed;
+
+  /* ------------------------------------------------------------------ */
+  /* Ed25519 and SHA-512 (CIS signature primitives)                      */
+  /* ------------------------------------------------------------------ */
+
+  test_sha512();
+  test_ed25519_field();
+  test_ed25519_scalars();
+  test_ed25519_points();
+  test_ed25519_constants();
+  test_ed25519_verify();
+
+  /* ------------------------------------------------------------------ */
+  /* Custom trap verification                                            */
+  /* ------------------------------------------------------------------ */
+
+  if (argc > 1) {
+
+    printf("\n=== Custom Trap Execution Verification ===\n");
+
+    if (count_occ(HostHalOutput(), "You need to restart your device.") > 0) {
+      expect("You need to restart your device.", 1);
+    } else {
+      expect("SYSTEM HALTED", 1);
+    }
+
+    expect("SYSTEM HALTED", 1);
+
+    expect("#######", 1);
+
+    printf("\n=== RESULT: %d passed, %d failed ===\n", g_passed, g_failures);
+
+    fflush(stdout);
+
+    return (g_failures == 0) ? 0 : 1;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Normal transcript verification                                     */
+  /* ------------------------------------------------------------------ */
+
+  printf("\n=== Transcript verification ===\n");
+
+  fflush(stdout);
+
+  expect("[SUTF] Codec self-test: OK", 1);
+
+  expect("[RUNLVL] boot target: 5 (FULL)", 1);
+
+  expect("[RUNLVL] current=5 (FULL)", 1);
+
+  expect("[RUNLVL] config: verbosity=1 "
+         "watchdogMs=0 heapKB=262144 "
+         "maxHandles=65536",
+         1);
+
+  expect("[RUNLVL] profile: level 3, name NETWORK", 1);
+
+  expect("[RUNLVL]   + NETWORK", 1);
+
+  expect("[RUNLVL]   + AI", 1);
+
+  expect("[FINISHED] owinit", 1);
+
+  expect("[FINISHED] Kernel Integrity", 1);
+
+  expect("[PS] process/thread subsystem initialized", 1);
+
+  expect("[PS] owinit: process created (PID 1)", 1);
+
+  /* The thread line is printed only when the image was trusted and loaded, so
+   * it is asserted in the configuration where that happens.  In a default build
+   * the refusal above IS the outcome, and this line being absent is part of it:
+   * a thread for a refused image would be the bug, not the fix. */
+#ifdef CIS_DEV_TRUST
+  expect("[PS] owinit: thread 1 created, entry 0x", 1);
+#else
+  expect("[PS] owinit: thread 1 created, entry 0x", 0);
+#endif
+
+  expect("[PS] boot context captured (thread 0)", 1);
+
+  expect("[PS] scheduler started (100 Hz)", 1);
+
+  expect("[VIP] UniVIP online: root volume 0 @ LBA 131200", 1);
+
+  expect("[VIP] mount code 0x11AD02", 1);
+
+  expect("[VIP] volume 1 base LBA 131200", 1);
+
+  expect("[VIP] '/boot/bootvid.owd' sector_offset=12 flags=0x3", 1);
+
+  expect("[VIP] lookup miss code 0x11AEE2", 1);
+
+  expect("[VIP] integrity code 0x", 1);
+
+  expect("[FS] format: OK", 1);
+
+  expect("[FS] owfs mount: OK", 1);
+
+  expect("[FS] mkdir 'System': OK", 1);
+
+  expect("[FS] create 'bootvid.owd': OK", 1);
+
+  expect("[FS] write 'bootvid.owd': OK", 1);
+
+  expect("[FS] OWFS: MOUNTED", 1);
+
+  expect("[FS] USFS: MOUNTED", 1);
+
+  expect("OpenWindows storage live", 2);
+
+  expect("[SUCS] request: staged, reboot required", 1);
+
+  expect("[SHUTDOWN] Exiting...", 1);
+
+  /* ------------------------------------------------------------------ */
+  /* Final result                                                        */
+  /* ------------------------------------------------------------------ */
+
+  printf("\n=== RESULT: %d passed, %d failed ===\n", g_passed, g_failures);
+
+  fflush(stdout);
+
+  return (g_failures == 0) ? 0 : 1;
+}
